@@ -1,6 +1,6 @@
 // Shared top bar for the Paperwatch pages: logo, the Limit Intents (trigger) and Queue links, and the wallet button.
 // Each page loads it with <script src="/site.js"></script> and names itself with <body data-page="queue|trigger">. The
-// server fills in the two page URLs (they're separate services).
+// server fills in the two page URLs: /limits and /queue on paperwatch.app, where one server serves both.
 //
 // Wallets are found the way wagmi (and Papertrade's own app) finds them: EIP-6963 discovery, where each installed
 // wallet announces itself with its name and icon. Rabby, MetaMask and Phantom are always listed (with install or
@@ -82,11 +82,10 @@
   const page = document.body.dataset.page
   const bar = document.createElement('header')
   bar.className = 'site-bar'
-  const home = PAGES.find((p) => p.id === 'queue')
   bar.innerHTML = `<div class="site-bar-in">
-    <a class="site-logo" href="${page === 'queue' ? '/' : home.url || '/'}">${LOGO}<span>Paperwatch</span></a>
+    <a class="site-logo" href="/">${LOGO}<span>Paperwatch</span></a>
     <nav class="site-nav">${PAGES.map((p) => {
-      const href = p.id === page ? '/' : p.url
+      const href = p.id === page ? location.pathname : p.url
       return `<a href="${href || '#'}" class="${p.id === page ? 'on' : ''}${href ? '' : ' off'}"${href ? '' : ' title="Not deployed yet"'}>${p.label}</a>`
     }).join('')}</nav>
     <div class="site-stats" id="site-stats"></div>

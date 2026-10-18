@@ -12,6 +12,7 @@ import { PublicStream } from './intake.ts'
 import { toPriceRaw } from './market.ts'
 import { sideHeadroomUsd } from './risk.ts'
 import { serveSiteJs } from './site.ts'
+import { startQueueRelay } from './queue-viz.ts'
 import { CandleStore } from './candles.ts'
 import { NonceSource } from './state.ts'
 import { UserStore, issueToken, openKey, readToken, sealKey, signInMessage, type UserRecord } from './users.ts'
@@ -551,13 +552,19 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   })
 
   const candles = new CandleStore()
+  // paperwatch.app is this one server: Limit Intents at /limits, the queue page at /queue (also /que), shared top bar.
+  const queue = startQueueRelay()
   createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://x')
-    if (req.method === 'GET' && url.pathname === '/') {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(readFileSync(join(import.meta.dirname, 'trigger.html')))
-      return
+    if (req.method === 'GET') {
+      if (url.pathname === '/') return void res.writeHead(302, { location: '/limits' }).end()
+      if (url.pathname === '/limits' || url.pathname === '/limits/') {
+        return void res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(readFileSync(join(import.meta.dirname, 'trigger.html')))
+      }
+      if (['/queue', '/queue/', '/que', '/que/'].includes(url.pathname)) return queue.page(res)
+      if (url.pathname === '/events') return queue.events(req, res)
+      if (url.pathname === '/site.js') return serveSiteJs(res, true)
     }
-    if (req.method === 'GET' && url.pathname === '/site.js') return serveSiteJs(res)
     if (!url.pathname.startsWith('/api/')) return json(res, 404, { error: 'not found' })
     // Every write needs our header: browsers won't send it cross-site without a preflight we never allow (CSRF).
     if (req.method !== 'GET' && req.headers['x-paperwatch'] !== '1') return json(res, 403, { error: 'missing request header' })

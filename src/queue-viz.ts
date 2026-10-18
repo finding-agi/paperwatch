@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { createServer, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import { getTradingState } from './api.ts'
 import { readMids } from './market.ts'
@@ -104,7 +104,12 @@ function condense(s: Record<string, any>) {
   }
 }
 
-export async function runQueueView(): Promise<void> {
+/**
+ * Start the queue relay (stream subscriptions, Hyperliquid mids, OI polls) and return its two routes: the /events
+ * stream and the page. `npm run queue` serves them on their own; on paperwatch.app the Limit Intents server mounts
+ * them at /queue.
+ */
+export function startQueueRelay() {
   const history: string[] = []
   const clients = new Set<ServerResponse>()
   let connected = false
@@ -226,17 +231,26 @@ export async function runQueueView(): Promise<void> {
   }
   pollOi()
 
-  createServer((req, res) => {
-    if (req.url === '/events') {
+  return {
+    events(req: IncomingMessage, res: ServerResponse) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
       res.write(`event: status\ndata: ${JSON.stringify({ connected })}\n\nevent: mid\ndata: ${JSON.stringify({ t: Date.now(), mids })}\n\n${history.join('')}`)
       clients.add(res)
       req.on('close', () => clients.delete(res))
-      return
-    }
+    },
+    page(res: ServerResponse) {
+      // Read per request so edits to the page show on reload.
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(readFileSync(join(import.meta.dirname, 'queue-viz.html')))
+    },
+  }
+}
+
+export async function runQueueView(): Promise<void> {
+  const relay = startQueueRelay()
+  createServer((req, res) => {
+    if (req.url === '/events') return relay.events(req, res)
     if (req.url === '/site.js') return serveSiteJs(res)
-    // Read per request so edits to the page show on reload.
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(readFileSync(join(import.meta.dirname, 'queue-viz.html')))
+    relay.page(res)
   }).listen(PORT, HOST, () => console.log(`${ts()} queue view listening on ${HOST}:${PORT}`))
 
   await new Promise<void>((resolve) => process.once('SIGINT', resolve))
