@@ -20,6 +20,21 @@ export function serveChartJs(res: ServerResponse): void {
   res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=86400' }).end(readFileSync(CHART_JS))
 }
 
+// Brand files and the Manrope font (self-hosted from node_modules, so the CSP needs no outside font host).
+const ASSETS: Record<string, [string, string]> = {
+  'logo.png': [join(import.meta.dirname, 'assets', 'logo.png'), 'image/png'],
+  'favicon.png': [join(import.meta.dirname, 'assets', 'favicon.png'), 'image/png'],
+  'apple-touch-icon.png': [join(import.meta.dirname, 'assets', 'apple-touch-icon.png'), 'image/png'],
+  'manrope.woff2': [join(import.meta.dirname, '..', 'node_modules', '@fontsource-variable', 'manrope', 'files', 'manrope-latin-wght-normal.woff2'), 'font/woff2'],
+}
+/** Serve /assets/<name> from a fixed list (no paths from the request ever reach the filesystem); false if unknown. */
+export function serveAsset(res: ServerResponse, name: string): boolean {
+  const asset = Object.hasOwn(ASSETS, name) ? ASSETS[name] : undefined // never Object.prototype keys like __proto__
+  if (!asset) return false
+  res.writeHead(200, { 'content-type': asset[1], 'cache-control': 'public, max-age=86400' }).end(readFileSync(asset[0]))
+  return true
+}
+
 /** Headers for every response: no MIME sniffing, no framing (clickjacking), no referrer leaks, HTTPS once deployed. */
 export function baseHeaders(res: ServerResponse): void {
   res.setHeader('x-content-type-options', 'nosniff')

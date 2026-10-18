@@ -24,6 +24,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@fontsource-variable/manrope": "5.2.8",
     "lightweight-charts": "4.2.0",
     "viem": "2.56.9"
   },

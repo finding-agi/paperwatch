@@ -11,7 +11,7 @@ import { EXCHANGE_DOMAIN, deadlineFromNow, intentFromSignature, signIntent, wall
 import { PublicStream } from './intake.ts'
 import { toPriceRaw } from './market.ts'
 import { sideHeadroomUsd } from './risk.ts'
-import { baseHeaders, serveChartJs, servePage, serveSiteJs } from './site.ts'
+import { baseHeaders, serveAsset, serveChartJs, servePage, serveSiteJs } from './site.ts'
 import { startQueueRelay } from './queue-viz.ts'
 import { CandleStore } from './candles.ts'
 import { NonceSource } from './state.ts'
@@ -587,6 +587,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (url.pathname === '/') return void res.writeHead(302, { location: '/limits' }).end()
       if (url.pathname === '/limits' || url.pathname === '/limits/') return servePage(res, 'trigger.html')
       if (url.pathname === '/vendor/lightweight-charts.js') return serveChartJs(res)
+      if (url.pathname.startsWith('/assets/') && serveAsset(res, url.pathname.slice(8))) return
       if (['/queue', '/queue/', '/que', '/que/'].includes(url.pathname)) return queue.page(res)
       if (url.pathname === '/events') return queue.events(req, res)
       if (url.pathname === '/site.js') return serveSiteJs(res, true)

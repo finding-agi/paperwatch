@@ -4,14 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Limit Intents</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='2' y='2' width='60' height='60' rx='14' fill='%23f4eedb' stroke='%23d9d0b8' stroke-width='2'/%3E%3Ctext x='14' y='44' font-family='ui-monospace,Menlo,monospace' font-size='40' font-weight='700' fill='%23211b14'%3Ep%3C/text%3E%3Ccircle cx='46' cy='42' r='5' fill='%23b5602c'/%3E%3C/svg%3E">
+<link rel="icon" type="image/png" href="/assets/favicon.png">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <script src="/vendor/lightweight-charts.js"></script>
 <style>
-  /* Same cream / forest-green / burnt-orange theme as paperwatch; laid out like Papertrade's trade screen. */
+  /* Paperwatch brand: brown page, light-brown widgets, orange accent. Text on the widgets is dark brown for contrast. */
   :root {
     color-scheme: light;
-    --page: #ece6d1; --surface: #f4eedb; --raised: #fbf8f2; --ink: #211b14; --ink-2: #322f27; --label: #736c5e;
-    --grid: #e6dfc9; --border: #e1d9c2; --line: #b5602c; --green: #395e3d; --red: #8f3328;
+    --page: #50413d; --surface: #e1c3bb; --raised: #ead3cc; --ink: #2b201c; --ink-2: #3b2e2a; --label: #6b524b;
+    --grid: #d6b5ac; --border: #cfaea4; --line: #f04f24; --line-text: #b8380f; --green: #2f5a36; --red: #9c2b1b;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
@@ -29,7 +30,7 @@
   .chip.dry { background: var(--green); }
   .chip.mock { background: var(--raised); color: var(--label); border: 1px solid var(--border); }
 
-  .link { font: inherit; font-size: inherit; border: 0; padding: 0; background: none; color: var(--line); cursor: pointer; text-decoration: underline; }
+  .link { font: inherit; font-size: inherit; border: 0; padding: 0; background: none; color: var(--line-text); cursor: pointer; text-decoration: underline; }
 
   /* Layout: chart and orders on the left, account and ticket on the right. */
   #app { display: grid; gap: 8px; align-items: start; }
@@ -89,7 +90,7 @@
   .field-label span + span { text-transform: none; letter-spacing: 0; font-weight: 500; }
   .inline { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr); gap: 6px; }
   .mini { font: inherit; font-size: 13px; font-weight: 600; padding: 0 10px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink-2); cursor: pointer; }
-  .mini.on { border-color: var(--line); color: var(--line); }
+  .mini.on { border-color: var(--line); color: var(--line-text); }
   input[type=number], input[type=password], select {
     font: inherit; font-size: 16px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink); width: 100%; text-align: right; font-variant-numeric: tabular-nums;
   }
@@ -117,13 +118,13 @@
   td.wrap-ok { white-space: normal; }
   th.r, td.r { text-align: right; }
   .status { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--label); }
-  .status.armed { color: var(--line); }
+  .status.armed { color: var(--line-text); }
   .status.filled { color: var(--green); }
   .status.failed, .status.unconfirmed { color: var(--red); }
   .note { color: var(--label); font-size: 12px; }
   .cancel { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink-2); cursor: pointer; }
   .table-wrap { overflow-x: auto; }
-  .credit { font-size: 11px; color: var(--label); padding: 0 2px; }
+  .credit { font-size: 11px; color: rgba(225, 195, 187, 0.7); padding: 0 2px; }
   .credit a { color: inherit; }
   @media (max-width: 999px) { .credit { order: 5; } }
   @media (max-width: 640px) { .hide-sm { display: none; } }
@@ -249,7 +250,7 @@ function initChart() {
   chart = LightweightCharts.createChart($('chart'), {
     autoSize: true,
     // Our chart, so no TradingView logo on it; the license's attribution is the credit line under the orders.
-    layout: { background: { color: cssVar('--surface') }, textColor: cssVar('--label'), fontFamily: 'system-ui, -apple-system, sans-serif', attributionLogo: false },
+    layout: { background: { color: cssVar('--surface') }, textColor: cssVar('--label'), fontFamily: "'Manrope', system-ui, sans-serif", attributionLogo: false },
     grid: { vertLines: { color: cssVar('--grid') }, horzLines: { color: cssVar('--grid') } },
     rightPriceScale: { borderColor: cssVar('--border') },
     timeScale: { borderColor: cssVar('--border'), timeVisible: true, secondsVisible: false },

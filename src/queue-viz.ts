@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { getTradingState } from './api.ts'
 import { readMids } from './market.ts'
 import { sideHeadroomUsd } from './risk.ts'
-import { baseHeaders, servePage, serveSiteJs } from './site.ts'
+import { baseHeaders, serveAsset, servePage, serveSiteJs } from './site.ts'
 
 // Live view of Papertrade's relayer queue: locally with `npm run queue`, or as its own Railway service with
 // PT_PROCESS=queue (no volume, no keys). Relays the public stream's `pressure:current` (global intake queue
@@ -249,6 +249,7 @@ export async function runQueueView(): Promise<void> {
     baseHeaders(res)
     if (req.url === '/events') return relay.events(req, res)
     if (req.url === '/site.js') return serveSiteJs(res)
+    if (req.url?.startsWith('/assets/') && serveAsset(res, req.url.slice(8))) return
     relay.page(res)
   }).listen(PORT, HOST, () => console.log(`${ts()} queue view listening on ${HOST}:${PORT}`))
 
