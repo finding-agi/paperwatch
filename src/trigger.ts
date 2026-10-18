@@ -500,7 +500,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     const l = s.lifetime
     return {
       balanceUsd,
-      equityUsd: balanceUsd + openPnlUsd,
+      // The feed's balance is the free part; margin locked in open positions is still the account's, so add it back.
+      equityUsd: balanceUsd + usdOf(s.locked) + openPnlUsd,
       marginInUseUsd: usdOf(s.locked),
       openPnlUsd,
       queuedUsd: usdOf(s.queued), // winnings waiting in the LP payout queue

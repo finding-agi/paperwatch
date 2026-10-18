@@ -30,13 +30,6 @@
   .chip.mock { background: var(--raised); color: var(--label); border: 1px solid var(--border); }
 
   .link { font: inherit; font-size: inherit; border: 0; padding: 0; background: none; color: var(--line); cursor: pointer; text-decoration: underline; }
-  /* Enable-trading dialog. */
-  .modal { position: fixed; inset: 0; z-index: 70; background: rgba(33, 27, 20, 0.35); display: flex; align-items: center; justify-content: center; padding: 16px; }
-  .dialog { width: 100%; max-width: 400px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 18px; display: grid; gap: 12px; box-shadow: 0 16px 40px rgba(33, 27, 20, 0.2); }
-  .dialog ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; color: var(--ink-2); }
-  .dialog .btns { display: grid; grid-template-columns: 1fr 2fr; gap: 8px; }
-  .dialog .btns button { font: inherit; font-weight: 700; padding: 11px; border-radius: 3px; cursor: pointer; }
-  .ghost { border: 1px solid var(--border); background: var(--raised); color: var(--ink-2); }
 
   /* Layout: chart and orders on the left, account and ticket on the right. */
   #app { display: grid; gap: 8px; align-items: start; }
@@ -139,18 +132,6 @@
 <body data-page="trigger">
 <script src="/site.js"></script>
 <div class="wrap">
-  <div class="modal" id="enable-modal" hidden>
-    <div class="dialog" role="dialog" aria-modal="true" aria-label="Enable trading">
-      <h2>Enable trading</h2>
-      <ul>
-        <li>Paperwatch creates a Papertrade trading key for your account. Your wallet signs once to approve it. No gas.</li>
-        <li>We use it only to open your limit intents when they trigger. Papertrade trading keys can't withdraw funds.</li>
-        <li>It lasts 30 days. Turn it off any time from the account box.</li>
-      </ul>
-      <div class="btns"><button class="ghost" id="enable-cancel">Cancel</button><button class="go" id="enable-go">Approve in wallet</button></div>
-    </div>
-  </div>
-
   <div id="app">
     <div class="left">
       <div class="card chart-card">
@@ -556,8 +537,6 @@ async function step(fn) {
   try { await fn(); await poll() } catch (err) { showError(walletError(err)) } finally { busy = false; renderForm() }
 }
 
-$('enable-cancel').onclick = () => ($('enable-modal').hidden = true)
-$('enable-go').onclick = () => { $('enable-modal').hidden = true; step(enableTrading) }
 $('acct').onclick = async (e) => {
   if (e.target.id !== 'trading-off') return
   if (!confirm('Turn trading off? Your open limit intents are cancelled and Paperwatch deletes its trading key. Your wallet will then ask to revoke the key on Papertrade too (a small HyperEVM transaction, needs a little HYPE for gas).')) return
@@ -574,7 +553,7 @@ $('place').onclick = async () => {
   const st = stage()
   if (st === 'connect') return W().open()
   if (st === 'signin') return step(signIn)
-  if (st === 'enable') { $('enable-modal').hidden = false; return }
+  if (st === 'enable') return step(enableTrading)
   if (st !== 'ready') return
   const m = market()
   const body = { symbol: form.symbol, side: form.side, triggerPx: Number($('trigger').value), marginUsd: Number($('margin').value),
