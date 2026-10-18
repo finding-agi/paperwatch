@@ -25,6 +25,8 @@ export type UserRecord = {
     /** Set once the account feed shows the key registered on Papertrade. */
     registeredAt?: number
   }
+  /** The one-time trading unlock: a HYPE transfer to the fee wallet, checked on-chain. */
+  fee?: { tx: Hex; paidAt: number; wei: string }
   /** A key waiting for the wallet's approval: the RegisterSessionKey fields (decimal strings) it will sign. */
   pendingKey?: { address: Address; sealed: string; input: Record<string, string> }
 }

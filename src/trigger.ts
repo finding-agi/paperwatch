@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
-import { encodeFunctionData, verifyMessage, zeroAddress, type Address, type Hex } from 'viem'
+import { encodeFunctionData, formatEther, getAddress, parseEther, verifyMessage, zeroAddress, type Address, type Hex } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { AccountStream } from './account.ts'
 import { RelayerError, getTradingState, submitIntent, type Instrument, type TradingState } from './api.ts'
@@ -11,7 +11,7 @@ import { EXCHANGE_DOMAIN, deadlineFromNow, intentFromSignature, signIntent, wall
 import { PublicStream } from './intake.ts'
 import { toPriceRaw } from './market.ts'
 import { sideHeadroomUsd } from './risk.ts'
-import { serveSiteJs } from './site.ts'
+import { baseHeaders, serveChartJs, servePage, serveSiteJs } from './site.ts'
 import { startQueueRelay } from './queue-viz.ts'
 import { CandleStore } from './candles.ts'
 import { NonceSource } from './state.ts'
@@ -49,6 +49,11 @@ const MAX_ARMED_PER_WALLET = 20
 const IDLE_STREAM_MS = 5 * 60_000 // stop following an account with no armed orders after this long unseen
 const MAX_ACCOUNTS = 500 // account feeds open at once; past this, view-only lookups of new wallets wait
 const FAILED_OUTCOMES = new Set(['failed', 'expired', 'cancelled'])
+// Trading unlock: a one-time PT_FEE_HYPE (default 0.1) HYPE transfer on HyperEVM to PT_FEE_ADDRESS. Wallets in
+// PT_FEE_EXEMPT (comma-separated) skip it. Without PT_FEE_ADDRESS there is no fee.
+const FEE_ADDRESS = process.env.PT_FEE_ADDRESS ? getAddress(process.env.PT_FEE_ADDRESS) : null
+const FEE_WEI = parseEther(process.env.PT_FEE_HYPE || '0.1')
+const FEE_EXEMPT = new Set((process.env.PT_FEE_EXEMPT ?? '').split(',').map((w) => w.trim().toLowerCase()).filter(Boolean))
 const PENDING_REWARD_ABI = [{ type: 'function', name: 'pendingReward', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] }] as const
 const REWARD_REFRESH_MS = 60_000
 const REVOKE_ABI = [{ type: 'function', name: 'revokeSessionKey', stateMutability: 'nonpayable', inputs: [{ type: 'address' }], outputs: [] }] as const
@@ -195,6 +200,20 @@ const short = (w: string) => `${w.slice(0, 6)}…${w.slice(-4)}`
 const describe = (o: TriggerOrder) =>
   `${o.id} ${short(o.wallet)} ${o.isLong ? 'LONG' : 'SHORT'} ${o.symbol} ${o.when === 'below' ? '<=' : '>='} ${o.triggerPx} (${o.fixedMarginUsd !== undefined ? usd(o.fixedMarginUsd) : `${Math.round(o.marginPct * 100)}%`} at ${o.leverage}x)`
 
+type FeeTx = { from: string; to: string | null; value: bigint; chainId?: number }
+/**
+ * Why a transaction doesn't pay the trading fee for `wallet`, or null when it does: it must have succeeded on HyperEVM,
+ * come from that wallet, and send at least `minWei` straight to the fee address.
+ */
+export function feePaymentProblem(tx: FeeTx, status: string, wallet: string, feeAddress: string, minWei: bigint): string | null {
+  if (status !== 'success') return 'That transaction failed on-chain.'
+  if (tx.chainId !== undefined && tx.chainId !== 999) return 'That transaction is not on HyperEVM.'
+  if (tx.from.toLowerCase() !== wallet.toLowerCase()) return 'That transaction was sent from a different wallet.'
+  if (tx.to?.toLowerCase() !== feeAddress.toLowerCase()) return 'That transaction did not go to the fee wallet.'
+  if (tx.value < minWei) return `That transaction sent less than ${formatEther(minWei)} HYPE.`
+  return null
+}
+
 /** Friendly text for the relayer's refusals of a key registration. */
 function registrationError(err: RelayerError): string {
   if (err.reason === 'noDeposit') return 'Deposit at least $10 on papertrade.xyz first, then enable trading.'
@@ -320,6 +339,11 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     if (!key.registeredAt && Date.now() - (key.submittedAt ?? 0) < 180_000) return { status: 'pending' as const, ...info }
     return { status: 'none' as const }
   }
+
+  const feeOk = (wallet: Address) => !FEE_ADDRESS || FEE_EXEMPT.has(wallet.toLowerCase()) || Boolean(users.get(wallet)?.fee)
+  const usedFeeTxs = () => new Set(users.all().flatMap((u) => (u.fee ? [u.fee.tx.toLowerCase()] : [])))
+  const feeInfo = (wallet: Address | null) =>
+    FEE_ADDRESS && { address: FEE_ADDRESS, hype: formatEther(FEE_WEI), valueHex: `0x${FEE_WEI.toString(16)}`, required: wallet ? !feeOk(wallet) : true }
 
   const nonceSource = (user: UserRecord) => {
     const holder = { nextNonce: BigInt(user.nextNonce) }
@@ -525,6 +549,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     wallet,
     view,
     trading: wallet ? tradingStatus(users.get(wallet)) : null,
+    fee: feeInfo(wallet),
     freeUsd: view ? freeUsd(view) : null,
     inFlightUsd: view ? inFlightUsd(view) : 0,
     account: view ? accountBox(view) : null,
@@ -557,11 +582,11 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   const queue = startQueueRelay()
   createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://x')
+    baseHeaders(res)
     if (req.method === 'GET') {
       if (url.pathname === '/') return void res.writeHead(302, { location: '/limits' }).end()
-      if (url.pathname === '/limits' || url.pathname === '/limits/') {
-        return void res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(readFileSync(join(import.meta.dirname, 'trigger.html')))
-      }
+      if (url.pathname === '/limits' || url.pathname === '/limits/') return servePage(res, 'trigger.html')
+      if (url.pathname === '/vendor/lightweight-charts.js') return serveChartJs(res)
       if (['/queue', '/queue/', '/que', '/que/'].includes(url.pathname)) return queue.page(res)
       if (url.pathname === '/events') return queue.events(req, res)
       if (url.pathname === '/site.js') return serveSiteJs(res, true)
@@ -618,9 +643,34 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       }
       if (req.method === 'POST' && url.pathname === '/api/auth/logout') return json(res, 200, {}, { 'set-cookie': sessionCookie('', 0) })
 
+      // Unlock: check the wallet's HYPE payment on-chain (status, sender, recipient, amount), once per transaction.
+      if (req.method === 'POST' && url.pathname === '/api/fee/confirm') {
+        if (!needWallet()) return
+        if (feeOk(wallet!)) return json(res, 200, { paid: true })
+        const body = await readBody(req)
+        const hash = String(body.hash ?? '')
+        if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return json(res, 400, { error: 'bad transaction hash' })
+        if (usedFeeTxs().has(hash.toLowerCase())) return json(res, 409, { error: 'That payment already unlocked a wallet.' })
+        const receipt = await client.waitForTransactionReceipt({ hash: hash as Hex, timeout: 90_000, pollingInterval: 1500 }).catch(() => null)
+        if (!receipt) return json(res, 202, { error: 'Payment not confirmed yet. It will be checked again shortly.' })
+        const tx = await client.getTransaction({ hash: hash as Hex })
+        const problem = feePaymentProblem(tx, receipt.status, wallet!, FEE_ADDRESS!, FEE_WEI)
+        if (problem) return json(res, 400, { error: problem })
+        const user = users.getOrCreate(wallet!)
+        user.fee = { tx: hash.toLowerCase() as Hex, paidAt: Date.now(), wei: String(tx.value) }
+        users.save()
+        log('fee', `${short(user.wallet)} paid ${formatEther(tx.value)} HYPE (${hash.slice(0, 10)})`)
+        return json(res, 200, { paid: true })
+      }
+      const locked = () => {
+        if (feeOk(wallet!)) return false
+        json(res, 402, { error: `Unlock trading first (${formatEther(FEE_WEI)} HYPE).` })
+        return true
+      }
+
       // Enable trading: a fresh trading key, approved by the wallet's own signature over Papertrade's RegisterSessionKey.
       if (req.method === 'POST' && url.pathname === '/api/trading/prepare') {
-        if (!needWallet()) return
+        if (!needWallet() || locked()) return
         const user = users.getOrCreate(wallet!)
         const status = tradingStatus(user)
         if (status.status === 'active' && status.expiry > Date.now() / 1000 + KEY_RENEW_SEC) return json(res, 409, { error: 'Trading is already enabled.' })
@@ -645,7 +695,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         return json(res, 200, { typedData: walletTypedData(EXCHANGE_DOMAIN, 'RegisterSessionKey', input), key: keyAddress })
       }
       if (req.method === 'POST' && url.pathname === '/api/trading/register') {
-        if (!needWallet()) return
+        if (!needWallet() || locked()) return
         const body = await readBody(req)
         const user = users.get(wallet!)
         const pending = user?.pendingKey
@@ -693,7 +743,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       }
 
       if (req.method === 'POST' && url.pathname === '/api/orders') {
-        if (!needWallet()) return
+        if (!needWallet() || locked()) return
         if (tradingStatus(users.get(wallet!)).status !== 'active') return json(res, 400, { error: 'Enable trading first.' })
         if (orders.filter((o) => o.wallet === wallet && o.status === 'armed').length >= MAX_ARMED_PER_WALLET) {
           return json(res, 400, { error: `You can have up to ${MAX_ARMED_PER_WALLET} open limit intents.` })
@@ -724,7 +774,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     }
   }).listen(PORT, HOST, () => {
     const armed = orders.filter((o) => o.status === 'armed').length
-    log('start', `${mode.toUpperCase()} limit intents on ${HOST}:${PORT}; ${users.all().length} account(s), ${armed} armed order(s); hold while ${MAX_QUEUED}+ intents queued. Opens only, never closes.`)
+    const fee = FEE_ADDRESS ? `unlock ${formatEther(FEE_WEI)} HYPE to ${short(FEE_ADDRESS)} (${FEE_EXEMPT.size} exempt)` : 'no unlock fee'
+    log('start', `${mode.toUpperCase()} limit intents on ${HOST}:${PORT}; ${users.all().length} account(s), ${armed} armed order(s); ${fee}; hold while ${MAX_QUEUED}+ intents queued. Opens only, never closes.`)
   })
 
   await new Promise<void>((resolve) => {

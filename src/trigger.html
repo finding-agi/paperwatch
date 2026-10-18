@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Limit Intents</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='2' y='2' width='60' height='60' rx='14' fill='%23f4eedb' stroke='%23d9d0b8' stroke-width='2'/%3E%3Ctext x='14' y='44' font-family='ui-monospace,Menlo,monospace' font-size='40' font-weight='700' fill='%23211b14'%3Ep%3C/text%3E%3Ccircle cx='46' cy='42' r='5' fill='%23b5602c'/%3E%3C/svg%3E">
-<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="/vendor/lightweight-charts.js"></script>
 <style>
   /* Same cream / forest-green / burnt-orange theme as paperwatch; laid out like Papertrade's trade screen. */
   :root {
@@ -220,7 +220,8 @@
 </div>
 <script>
 const $ = (id) => document.getElementById(id)
-const store = { get: (k) => { try { return localStorage.getItem(k) } catch { return null } }, set: (k, v) => { try { localStorage.setItem(k, v) } catch {} } }
+const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+const store = { get: (k) => { try { return localStorage.getItem(k) } catch { return null } }, set: (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v) } catch {} } }
 let state = null
 const form = { symbol: store.get('trigger-symbol') || 'BTC', side: 'long', touched: false, marginTouched: false, tab: 'open', tf: 900 }
 
@@ -356,7 +357,7 @@ function renderChart() {
 function renderForm() {
   const m = market()
   if (!m) return
-  $('market').innerHTML = state.markets.map((x) => `<button data-v="${x.symbol}" class="${x.symbol === form.symbol ? 'on' : ''}">${x.symbol}</button>`).join('')
+  $('market').innerHTML = state.markets.map((x) => `<button data-v="${esc(x.symbol)}" class="${x.symbol === form.symbol ? 'on' : ''}">${esc(x.symbol)}</button>`).join('')
   for (const b of $('side').children) b.classList.toggle('on', b.dataset.v === form.side)
   $('sym').textContent = m.symbol
   $('px').textContent = px(liveMid[m.symbol] ?? m.mid)
@@ -395,7 +396,7 @@ function renderForm() {
   else if (!m.openable) problem = `${m.symbol} opens are paused right now.`
   if (!$('msg').dataset.sticky) $('msg').textContent = problem
   const st = stage()
-  $('place').textContent = { connect: 'Connect Wallet', signin: 'Sign In', enable: 'Enable Trading', pending: 'Enabling trading…', ready: `Place ${form.side === 'long' ? 'Long' : 'Short'} Limit Intent` }[st]
+  $('place').textContent = { connect: 'Connect Wallet', signin: 'Sign In', pay: `Unlock Trading · ${state.fee?.hype ?? ''} HYPE`, enable: 'Enable Trading', pending: 'Enabling trading…', ready: `Place ${form.side === 'long' ? 'Long' : 'Short'} Limit Intent` }[st]
   $('place').disabled = st === 'pending' || busy
   $('place').classList.toggle('short', st === 'ready' && form.side === 'short')
   renderChart()
@@ -430,7 +431,8 @@ function renderAccount() {
   const t = state.trading
   $('acct').innerHTML = !state.view ? 'not connected' : !state.wallet ? 'off · sign in to trade'
     : t?.status === 'active' ? `on until ${new Date(t.expiry * 1000).toLocaleDateString()} · <button class="link" id="trading-off">Turn off</button>`
-    : t?.status === 'pending' ? 'waiting for Papertrade…' : 'off'
+    : t?.status === 'pending' ? 'waiting for Papertrade…'
+    : state.fee?.required ? `locked · ${esc(state.fee.hype)} HYPE to unlock` : 'off'
   $('queue').textContent = state.queued == null ? '—' : `${state.queued}${state.queued >= state.maxQueued ? ' ⚠' : ''}`
 }
 
@@ -449,13 +451,13 @@ function renderOrders() {
     const margin = o.marginUsd ?? o.fixedMarginUsd
     return `<tr>
       <td class="${o.isLong ? 'up' : 'down'}"><b>${o.isLong ? 'Long' : 'Short'}</b></td>
-      <td>${o.symbol}</td>
+      <td>${esc(o.symbol)}</td>
       <td class="r">${o.when === 'below' ? '≤' : '≥'} ${px(o.triggerPx)}</td>
       <td class="r">${margin != null ? money(margin) : `${Math.round(o.marginPct * 100)}%`}</td>
       <td class="r hide-sm">${o.leverage}×</td>
-      <td><span class="status ${o.status}">${o.status}</span></td>
-      <td class="hide-sm wrap-ok">${detail}${o.note ? `<div class="note">${o.note.replace(/</g, '&lt;')}</div>` : ''}</td>
-      <td class="r">${o.status === 'armed' ? `<button class="cancel" data-id="${o.id}">Cancel</button>` : ''}</td>
+      <td><span class="status ${esc(o.status)}">${esc(o.status)}</span></td>
+      <td class="hide-sm wrap-ok">${detail}${o.note ? `<div class="note">${esc(o.note)}</div>` : ''}</td>
+      <td class="r">${o.status === 'armed' ? `<button class="cancel" data-id="${esc(o.id)}">Cancel</button>` : ''}</td>
     </tr>`
   }).join('')
 }
@@ -475,6 +477,9 @@ async function poll() {
     const browser = window.paperwatchWallet?.account
     if (state.wallet && browser !== undefined && browser !== state.wallet && walletReady) { await api('/api/auth/logout', {}); state = await api('/api/state' + (viewing ? `?wallet=${viewing}` : '')) }
     render()
+    // A payment sent earlier from this browser that never got confirmed: check it once.
+    const pending = stage() === 'pay' && !busy && store.get(feeTxKey())
+    if (pending && feeChecked !== pending) { feeChecked = pending; step(() => confirmFee(pending)) }
   } catch {}
   poll.t = setTimeout(poll, 1000)
 }
@@ -510,6 +515,7 @@ function stage() {
   const account = W()?.account
   if (!account) return 'connect'
   if (state?.wallet !== account) return 'signin'
+  if (state.fee?.required) return 'pay'
   if (state.trading?.status === 'pending') return 'pending'
   if (state.trading?.status !== 'active') return 'enable'
   return 'ready'
@@ -523,6 +529,31 @@ async function signIn() {
   const signature = await W().provider.request({ method: 'personal_sign', params: [message, account] })
   await api('/api/auth/verify', { wallet: account, signature })
 }
+
+// One-time unlock: the wallet sends the fee in HYPE on HyperEVM; our server then checks that transaction on-chain.
+// The hash is kept in this browser until it's confirmed, so a closed tab or a slow block doesn't lose the payment.
+const feeTxKey = () => `paperwatch-fee-tx-${W().account}`
+async function payFee() {
+  let hash = store.get(feeTxKey())
+  if (!hash) {
+    await W().ensureChain()
+    hash = await W().provider.request({ method: 'eth_sendTransaction', params: [{ from: W().account, to: state.fee.address, value: state.fee.valueHex }] })
+    store.set(feeTxKey(), hash)
+  }
+  await confirmFee(hash)
+}
+async function confirmFee(hash) {
+  try {
+    await api('/api/fee/confirm', { hash })
+    store.set(feeTxKey(), null)
+  } catch (err) {
+    // A failed or wrong payment can't be retried as-is; forget it so the next click sends a fresh one.
+    if (!/not confirmed yet/i.test(err.message)) store.set(feeTxKey(), null)
+    throw err
+  }
+}
+let feeChecked = ''
+window.addEventListener('paperwatch:wallet', () => (feeChecked = ''))
 
 async function enableTrading() {
   await W().ensureChain() // the approval is for HyperEVM (chain 999); wallets refuse to sign it on another chain
@@ -553,6 +584,7 @@ $('place').onclick = async () => {
   const st = stage()
   if (st === 'connect') return W().open()
   if (st === 'signin') return step(signIn)
+  if (st === 'pay') return step(payFee)
   if (st === 'enable') return step(enableTrading)
   if (st !== 'ready') return
   const m = market()

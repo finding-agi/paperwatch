@@ -85,3 +85,19 @@ test('candle history merges by bucket: fresh data wins, old buckets age out', as
   const merged = mergeCandles([c(100, 1), c(200, 2), c(300, 3)], [c(300, 3.5), c(400, 4)], 200)
   assert.deepEqual(merged.map((x) => [x.time, x.close]), [[200, 2], [300, 3.5], [400, 4]])
 })
+
+test('the unlock fee only counts a successful HyperEVM transfer of enough HYPE from the wallet to the fee address', async () => {
+  const { feePaymentProblem } = await import('../src/trigger.ts')
+  const fee = '0xEFF64D64a23487f72370Df85F3ceA01941453CdE'
+  const me = '0x10e942585cebf3dcf8377ff8ec38f2458662eec3'
+  const min = 10n ** 17n // 0.1 HYPE
+  const ok = { from: me, to: fee.toLowerCase(), value: min, chainId: 999 }
+  assert.equal(feePaymentProblem(ok, 'success', me, fee, min), null)
+  assert.equal(feePaymentProblem({ ...ok, value: min * 2n }, 'success', me.toUpperCase().replace('0X', '0x'), fee, min), null)
+  assert.match(feePaymentProblem(ok, 'reverted', me, fee, min)!, /failed/)
+  assert.match(feePaymentProblem({ ...ok, value: min - 1n }, 'success', me, fee, min)!, /less than 0.1 HYPE/)
+  assert.match(feePaymentProblem({ ...ok, from: '0x' + '1'.repeat(40) }, 'success', me, fee, min)!, /different wallet/)
+  assert.match(feePaymentProblem({ ...ok, to: '0x' + '2'.repeat(40) }, 'success', me, fee, min)!, /fee wallet/)
+  assert.match(feePaymentProblem({ ...ok, to: null }, 'success', me, fee, min)!, /fee wallet/)
+  assert.match(feePaymentProblem({ ...ok, chainId: 1 }, 'success', me, fee, min)!, /HyperEVM/)
+})

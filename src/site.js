@@ -119,7 +119,8 @@
   const found = new Map() // rdns -> { info, provider }
   window.addEventListener('eip6963:announceProvider', (e) => {
     const { info, provider } = e.detail ?? {}
-    if (info?.rdns && provider) found.set(info.rdns, { info, provider })
+    // Announcements are untrusted page events: keep only a data: image icon, and escape names wherever shown.
+    if (info?.rdns && provider) found.set(info.rdns, { info: { ...info, icon: /^data:image\//.test(info.icon ?? '') ? info.icon : '' }, provider })
     if (!modal.hidden) renderWallets()
   })
   window.dispatchEvent(new Event('eip6963:requestProvider'))

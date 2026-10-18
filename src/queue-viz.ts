@@ -1,10 +1,9 @@
-import { readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import { getTradingState } from './api.ts'
 import { readMids } from './market.ts'
 import { sideHeadroomUsd } from './risk.ts'
-import { serveSiteJs } from './site.ts'
+import { baseHeaders, servePage, serveSiteJs } from './site.ts'
 
 // Live view of Papertrade's relayer queue: locally with `npm run queue`, or as its own Railway service with
 // PT_PROCESS=queue (no volume, no keys). Relays the public stream's `pressure:current` (global intake queue
@@ -84,8 +83,8 @@ export class WaitEstimator {
 function condense(s: Record<string, any>) {
   return {
     t: s.ts,
-    queued: s.queuedIntents,
-    submitted: s.submittedIntents,
+    queued: Number(s.queuedIntents),
+    submitted: Number(s.submittedIntents),
     queuedGas: Number(s.totalQueuedGas),
     submittedGas: Number(s.totalSubmittedGas),
     limit: Number(s.blockGasLimit),
@@ -161,7 +160,7 @@ export function startQueueRelay() {
             long: t.side === 'long',
             kind: t.kind,
             margin: Math.round(t.notionalUsd / t.leverage),
-            lev: t.leverage,
+            lev: Number(t.leverage),
             notional: Math.round(t.notionalUsd),
           }))
           for (const fill of fills) unresolved.push({ fill, at: Date.now() })
@@ -239,8 +238,7 @@ export function startQueueRelay() {
       req.on('close', () => clients.delete(res))
     },
     page(res: ServerResponse) {
-      // Read per request so edits to the page show on reload.
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(readFileSync(join(import.meta.dirname, 'queue-viz.html')))
+      servePage(res, 'queue-viz.html') // read per request, so edits show on reload
     },
   }
 }
@@ -248,6 +246,7 @@ export function startQueueRelay() {
 export async function runQueueView(): Promise<void> {
   const relay = startQueueRelay()
   createServer((req, res) => {
+    baseHeaders(res)
     if (req.url === '/events') return relay.events(req, res)
     if (req.url === '/site.js') return serveSiteJs(res)
     relay.page(res)
