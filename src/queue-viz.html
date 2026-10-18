@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paperwatch</title>
+<!-- Cream "p" like Papertrade's, with an orange live dot in place of their underscore so it isn't mistaken for the official site. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='2' y='2' width='60' height='60' rx='14' fill='%23f4eedb' stroke='%23d9d0b8' stroke-width='2'/%3E%3Ctext x='14' y='44' font-family='ui-monospace,Menlo,monospace' font-size='40' font-weight='700' fill='%23211b14'%3Ep%3C/text%3E%3Ccircle cx='46' cy='42' r='5' fill='%23b5602c'/%3E%3C/svg%3E">
+<style>
+  /* Papertrade's own cream / forest-green / burnt-orange theme (sampled from exchange.papertrade.xyz). */
+  :root {
+    color-scheme: light;
+    --page: #ece6d1;
+    --surface: #f4eedb;
+    --raised: #fbf8f2;
+    --ink: #211b14;
+    --ink-2: #322f27;
+    --label: #736c5e;
+    --axis: #827c69;
+    --grid: #e6dfc9;
+    --rule: #5c574c;
+    --border: #e1d9c2;
+    --line: #b5602c;
+    --green: #395e3d;
+    --red: #8f3328;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink-2);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 16px; display: grid; gap: 8px; }
+  /* Dashboard on wide screens: the queue across the top, the book and the OI caps side by side under it. */
+  @media (min-width: 1000px) {
+    .wrap { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); align-items: start; }
+    #queue-card { grid-column: 1 / -1; }
+  }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 3px; padding: 16px; min-width: 0; }
+
+  /* Numbers roll digit by digit, like the counters on Papertrade's site. */
+  .roll { display: inline-flex; vertical-align: bottom; line-height: 1.25; white-space: pre; font-variant-numeric: tabular-nums; }
+  .roll .d { display: inline-block; height: 1.25em; overflow: hidden; }
+  .roll .strip { display: flex; flex-direction: column; transition: transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .roll .strip span { display: block; height: 1.25em; }
+  @media (prefers-reduced-motion: reduce) { .roll .strip { transition: none; } }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px 4px 7px; border-radius: 3px;
+    font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #fff;
+  }
+  .chip svg { width: 14px; height: 14px; }
+  .chip.clear { background: var(--green); }
+  .chip.building { background: var(--line); }
+  .chip.backed { background: var(--red); }
+  .chip.offline { color: var(--label); background: var(--raised); border: 1px solid var(--border); padding-left: 9px; }
+
+  /* Paper Queue: one column per figure, label over value, so the widget stays short. */
+  .hint { color: var(--label); text-decoration: underline dashed var(--axis) 1px; text-underline-offset: 5px; cursor: help; }
+  .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 16px; }
+  @media (max-width: 760px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .stat { display: flex; flex-direction: column; gap: 6px; min-width: 0; font-size: 14px; }
+  .stat .hint { align-self: flex-start; }
+  .stat .roll { color: var(--ink-2); font-size: 20px; }
+  .roll.up { color: var(--red); }
+  .roll.down { color: var(--green); }
+
+  .widget-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 26px; margin-bottom: 10px; }
+  .widget h2 { margin: 0; color: var(--ink); font-size: 14px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .widget.stale { opacity: 0.55; }
+
+  /* Order-book view of recent fills: sell flow above the live mid, buy flow below, biggest nearest the mid. */
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+  .seg button { font: inherit; font-size: 13px; font-weight: 700; letter-spacing: 0.06em; padding: 3px 12px; border: 0; background: transparent; color: var(--label); cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: var(--raised); color: var(--ink); }
+  .aside { color: var(--label); font-size: 13px; }
+  .ob-head, .ob-row { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 0.7fr) minmax(0, 1fr) minmax(0, 0.6fr); gap: 12px; align-items: center; padding: 0 10px; }
+  .ob-head { color: var(--label); font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; padding-bottom: 6px; }
+  .ob-row { position: relative; height: 26px; font-size: 14px; font-variant-numeric: tabular-nums; }
+  .ob-row > span { position: relative; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ob-depth { position: absolute; top: 2px; bottom: 2px; right: 0; border-radius: 2px; }
+  .ob-r { text-align: right; }
+  .ob-row .ask { color: var(--red); }
+  .ob-row .bid { color: var(--green); }
+  .ob-row .sub { color: var(--label); }
+  .ob-mid { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 10px; margin: 4px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+  .ob-mid .roll { color: var(--ink); font-size: 26px; font-weight: 700; }
+  .mid-chg { font-size: 14px; margin-left: 10px; }
+  .mid-chg.up { color: var(--green); }
+  .mid-chg.down { color: var(--red); }
+
+  /* OI cap tanks: fill as new positions use the room under the cap, drain when the cap is raised or positions close. */
+  .tank-row { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; gap: 14px; align-items: center; height: 36px; font-size: 16px; }
+  .tank-row .side { color: var(--label); }
+  .tank-row .roll { color: var(--ink-2); font-size: 18px; min-width: 9ch; justify-content: flex-end; }
+  .tank-row .roll.tight { color: var(--red); }
+  .tank { height: 16px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); overflow: hidden; }
+  .tank-fill { height: 100%; width: 0; transition: width 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .tank-fill.long { background: var(--green); }
+  .tank-fill.short { background: var(--red); }
+  .tank-sub { color: var(--label); font-size: 13px; margin: -4px 0 6px 70px; font-variant-numeric: tabular-nums; }
+  @media (prefers-reduced-motion: reduce) { .tank-fill { transition: none; } }
+</style>
+</head>
+<body data-page="queue">
+<script src="/site.js"></script>
+<div class="wrap">
+  <section class="card widget" id="queue-card">
+    <div class="widget-head"><h2>Paper Queue</h2><span class="chip offline" id="chip" aria-live="polite">Connecting…</span></div>
+    <div class="stats">
+      <div class="stat"><span class="hint" title="Intents waiting in Papertrade's relayer, plus ones sent but not yet in a block">Intents Ahead</span><span class="roll" id="q-ahead">–</span></div>
+      <div class="stat"><span class="hint" title="Rough wait for a new intent, at the pace blocks are taking Papertrade's intents right now">Wait Time</span><span class="roll" id="q-wait">–</span></div>
+      <div class="stat"><span class="hint" title="Queued: waiting in the relayer for gas room. Sent: already sent on-chain, waiting for a block.">Queued / Sent</span><span class="roll" id="q-split">–</span></div>
+      <div class="stat"><span class="hint" title="Change in queued gas over the last 15 s, in 3M-gas blocks. Red while it grows, green while it drains.">Backlog Trend</span><span class="roll" id="q-trend">–</span></div>
+      <div class="stat"><span class="hint" title="Margin of positions opened in the last 30 s: the median, and the share with $5k+ margin. If big ones keep landing while the backlog grows, size may be getting priority.">Fill Size</span><span class="roll" id="q-fills">–</span></div>
+    </div>
+  </section>
+
+  <section class="card widget" id="book-card">
+    <div class="widget-head">
+      <div class="seg" role="group" aria-label="Market"><button type="button" data-sym="ETH" class="on">ETH</button><button type="button" data-sym="BTC">BTC</button></div>
+      <span class="aside" title="Each row is a fill that landed in the last 60 s. Sell flow (short opens, long closes) sits above the price, buy flow (long opens, short closes) below, biggest nearest the price.">Last 60 s of fills</span>
+    </div>
+    <div class="ob-head"><span class="ob-r">Margin</span><span class="ob-r">Notional</span><span class="ob-r">Lev</span><span>Type</span><span class="ob-r">Age</span></div>
+    <div id="asks"></div>
+    <div class="ob-mid"><span><span class="roll" id="mid-px">–</span><span class="mid-chg" id="mid-chg"></span></span><span class="aside" id="mid-meta"></span></div>
+    <div id="bids"></div>
+  </section>
+
+  <section class="card widget" id="cap-card">
+    <div class="widget-head"><h2 id="cap-title">OI Cap</h2><span class="aside" title="The bar fills as new positions use up the room under the cap, and empties when Papertrade raises the cap or positions close.">Room used since the cap last moved</span></div>
+    <div class="tank-row"><span class="side">Long</span><div class="tank"><div class="tank-fill long" id="tank-long"></div></div><span class="roll" id="tank-long-room">–</span></div>
+    <div class="tank-sub" id="tank-long-sub"></div>
+    <div class="tank-row"><span class="side">Short</span><div class="tank"><div class="tank-fill short" id="tank-short"></div></div><span class="roll" id="tank-short-room">–</span></div>
+    <div class="tank-sub" id="tank-short-sub"></div>
+  </section>
+</div>
+
+<script>
+const TREND_MS = 15_000
+const pts = []            // relayer updates from the last ~20 s, for the backlog trend
+let gasPerIntent = 310_000 // updated from the live queue
+let lastQueueRoll = 0
+const FILL_WINDOW_MS = 30_000
+const BIG_MARGIN_USD = 5_000
+const blocks = new Map()  // block number -> block, for the queue status and the block number by the price
+let latest = null          // latest relayer snapshot; its clock times the fills
+let connected = false
+let oiLatest = null        // OI, cap and room per market and side, polled every 5 s
+const BOOK_MS = 60_000
+const BOOK_ROWS = 10      // per side
+const fills = []          // every fill from the last ~65 s: { seq, t, sym, long, kind, margin, lev, notional }
+const seenFills = new Set()
+let mids = {}             // live mid per symbol
+const midHistory = []     // { t, mids } over the last ~65 s, for the price change
+const capWindows = {}     // "ETH long" -> largest room seen since it last grew, the tank's 100%
+let lastMidRoll = 0
+let market = 'ETH'
+try { market = localStorage.getItem('paperwatch-market') || 'ETH' } catch {}
+const OI_TIGHT_USD = 1_000_000
+const OI_FULL_USD = 1_000 // Papertrade's minimum open notional: below this nobody can open on that side
+
+const $ = (id) => document.getElementById(id)
+const avg = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0)
+const dur = (s) => (s < 90 ? `${Math.max(1, Math.round(s))} s` : `${(s / 60).toFixed(1)} min`)
+
+const ICONS = {
+  clear: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5 8.2l2 2 4-4.3" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  building: '<svg viewBox="0 0 16 16"><path d="M8 2l6.5 11.5h-13z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8 6.5v3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="8" cy="11.6" r="0.9" fill="currentColor"/></svg>',
+  backed: '<svg viewBox="0 0 16 16"><path d="M5.3 1.8h5.4l3.5 3.5v5.4l-3.5 3.5H5.3l-3.5-3.5V5.3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M6 6l4 4M10 6l-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+}
+const LABELS = { clear: 'Clear', building: 'Building', backed: 'Backed up' }
+
+// ---- data -----------------------------------------------------------------------------------------------------------
+const es = new EventSource('/events')
+es.addEventListener('status', (e) => { connected = JSON.parse(e.data).connected; schedule() })
+es.addEventListener('pressure', (e) => onPressure(JSON.parse(e.data)))
+es.addEventListener('oi', (e) => onOi(JSON.parse(e.data)))
+es.addEventListener('fills', (e) => onFills(JSON.parse(e.data)))
+es.addEventListener('mid', (e) => onMid(JSON.parse(e.data)))
+es.onerror = () => { connected = false; schedule() }
+
+function onPressure(p) {
+  if (latest && p.t <= latest.t) return // history replayed after a reconnect
+  latest = p
+  pts.push({ t: p.t, qb: p.queuedGas / p.limit })
+  while (pts.length && pts[0].t < p.t - TREND_MS - 5_000) pts.shift()
+  for (const b of p.blocks) blocks.set(b.n, b)
+  if (blocks.size > 60) for (const n of [...blocks.keys()].sort((a, b) => a - b).slice(0, blocks.size - 30)) blocks.delete(n)
+  schedule()
+}
+
+function onFills(list) {
+  for (const f of list) if (!seenFills.has(f.seq)) { seenFills.add(f.seq); fills.push(f) }
+  const cutoff = now() - BOOK_MS - 5_000
+  while (fills.length && fills[0].t < cutoff) seenFills.delete(fills.shift().seq)
+  schedule()
+}
+
+function onMid(m) {
+  mids = m.mids
+  midHistory.push({ t: m.t, mids: { ...m.mids } })
+  while (midHistory.length && midHistory[0].t < m.t - BOOK_MS - 5_000) midHistory.shift()
+  schedule()
+}
+
+function onOi(o) {
+  if (oiLatest && o.t <= oiLatest.t) return
+  oiLatest = o
+  for (const m of o.markets) for (const side of ['long', 'short']) {
+    const key = `${m.symbol} ${side}`
+    if (m[side] != null && m[side] >= (capWindows[key] ?? 0)) capWindows[key] = m[side]
+  }
+  schedule()
+}
+
+/** The relayer's clock when it's live, so fill ages don't depend on this computer's clock. */
+const now = () => (latest && Date.now() - latest.t < 15_000 ? latest.t : Date.now())
+
+/** Shows `text` in `el`, rolling each digit to its new value; other characters stay put. */
+function roll(el, text) {
+  if (el.dataset.text === text) return
+  const shape = text.replace(/\d/g, '0')
+  if (el.dataset.shape !== shape) {
+    el.dataset.shape = shape
+    el.innerHTML = [...text].map((c) => /\d/.test(c)
+      ? `<span class="d"><span class="strip">${[...'0123456789'].map((n) => `<span>${n}</span>`).join('')}</span></span>`
+      : `<span class="sym">${c}</span>`).join('')
+    void el.offsetWidth // start new digits at 0 so they roll in
+  }
+  ;[...text].forEach((c, i) => { if (/\d/.test(c)) el.children[i].firstChild.style.transform = `translateY(-${Number(c) * 10}%)` })
+  el.dataset.text = text
+}
+
+// ---- render loop (at most 5 frames/s) -------------------------------------------------------------------------------
+let pending = false
+let lastRender = 0
+function schedule() {
+  if (pending) return
+  pending = true
+  setTimeout(() => requestAnimationFrame(() => { pending = false; lastRender = performance.now(); render() }), Math.max(0, 200 - (performance.now() - lastRender)))
+}
+setInterval(schedule, 1000)
+addEventListener('resize', schedule)
+
+function render() {
+  drawQueue()
+  $('book-card').classList.toggle('stale', !connected)
+  drawBook()
+  if (oiLatest) drawTanks()
+}
+
+// ---- Paper Queue ----------------------------------------------------------------------------------------------------
+function drawQueue() {
+  const chip = $('chip')
+  const age = latest ? (Date.now() - latest.t) / 1000 : Infinity
+  $('queue-card').classList.toggle('stale', !connected || age > 15)
+  if (!connected || age > 15) {
+    chip.className = 'chip offline'
+    chip.textContent = connected ? `No updates for ${Math.round(age)} s` : 'Reconnecting…'
+    return
+  }
+  // Clear: under one block of backlog. Building: one block or more, room for 2 intents or fewer, or rising while
+  // blocks are over 80% full. Backed up: 10 blocks or more (the Railway monitor's SLOW line).
+  const sorted = [...blocks.values()].sort((a, b) => a.n - b.n)
+  const qb = latest.queuedGas / latest.limit
+  const ago = pts.find((p) => p.t >= latest.t - TREND_MS)
+  const delta = ago ? qb - ago.qb : 0
+  const pb = (latest.queuedGas + latest.submittedGas) / latest.limit
+  const full5 = avg(sorted.slice(-5).map((b) => (b.gas / b.limit) * 100))
+  if (latest.queued > 0) gasPerIntent = latest.queuedGas / latest.queued
+  const room = Math.floor(avg(sorted.slice(-10).map((b) => Math.max(0, b.limit - (b.gas - b.pt)))) / gasPerIntent)
+  const drain = avg(sorted.slice(-20).map((b) => b.pt)) // Papertrade gas that actually landed per block (~1 s)
+  const state = qb >= 10 ? 'backed' : qb >= 1 || room <= 2 || (delta >= 0.5 && full5 >= 80) ? 'building' : 'clear'
+  chip.className = `chip ${state}`
+  chip.innerHTML = `${ICONS[state]}<span>${LABELS[state]}</span>`
+
+  // The widget rolls at most once a second so the digits stay readable.
+  if (Date.now() - lastQueueRoll < 1000) return
+  lastQueueRoll = Date.now()
+  roll($('q-ahead'), (latest.queued + latest.submitted).toLocaleString('en-US'))
+  roll($('q-wait'), pb >= 1 && drain < latest.limit * 0.01 ? 'Stalled' : `≈ ${dur(pb < 1 ? 1 : (pb * latest.limit) / drain)}`)
+  roll($('q-split'), `${latest.queued.toLocaleString('en-US')} / ${latest.submitted.toLocaleString('en-US')}`)
+  const trend = $('q-trend')
+  roll(trend, `${delta >= 0 ? '+' : '−'}${Math.abs(delta).toFixed(1)} blocks`)
+  trend.classList.toggle('up', delta >= 0.1)
+  trend.classList.toggle('down', delta <= -0.1)
+  const recent = fills.filter((f) => f.kind === 'open' && f.t >= latest.t - FILL_WINDOW_MS).map((f) => f.margin).sort((a, b) => a - b)
+  const big = recent.filter((m) => m >= BIG_MARGIN_USD).length
+  roll($('q-fills'), recent.length ? `${money(recent[Math.floor(recent.length / 2)])} · ${Math.round((big / recent.length) * 100)}% $5k+` : 'No opens')
+}
+
+// ---- book ------------------------------------------------------------------------------------------------------------
+for (const b of document.querySelectorAll('.seg button')) {
+  b.classList.toggle('on', b.dataset.sym === market)
+  b.addEventListener('click', () => {
+    market = b.dataset.sym
+    try { localStorage.setItem('paperwatch-market', market) } catch {}
+    for (const o of document.querySelectorAll('.seg button')) o.classList.toggle('on', o === b)
+    $('mid-px').dataset.text = ''
+    lastMidRoll = 0
+    schedule()
+  })
+}
+
+const isBuy = (f) => (f.kind === 'open') === f.long // long opens and short closes (and short liquidations) buy
+const typeOf = (f) => `${f.kind === 'open' ? 'Open' : /liq/i.test(f.kind) ? 'Liq' : 'Close'} ${f.long ? 'long' : 'short'}`
+
+function bookRow(f, side, maxMargin, t) {
+  if (!f) return '<div class="ob-row"></div>'
+  const age = Math.max(0, (t - f.t) / 1000)
+  const fade = age > 30 ? `opacity:${(1 - ((age - 30) / 30) * 0.55).toFixed(2)};` : ''
+  const fresh = age < 1.5 ? `box-shadow:inset 0 0 0 999px rgba(181,96,44,${(0.2 * (1 - age / 1.5)).toFixed(3)});` : '' // new fills flash orange
+  const width = Math.max(2, (f.margin / maxMargin) * 100)
+  const bar = side === 'ask' ? 'rgba(143,51,40,0.13)' : 'rgba(57,94,61,0.15)'
+  return `<div class="ob-row" style="${fade}${fresh}"><div class="ob-depth" style="width:${width.toFixed(1)}%;background:${bar}"></div>` +
+    `<span class="ob-r ${side}">${money(f.margin)}</span><span class="ob-r">${money(f.notional)}</span><span class="ob-r sub">${f.lev}×</span>` +
+    `<span class="sub">${typeOf(f)}</span><span class="ob-r sub">${Math.round(age)}s</span></div>`
+}
+
+function drawBook() {
+  const t = now()
+  const recent = fills.filter((f) => f.sym === market && t - f.t <= BOOK_MS)
+  const top = (list) => list.sort((a, b) => b.margin - a.margin).slice(0, BOOK_ROWS)
+  const asks = top(recent.filter((f) => !isBuy(f))).reverse() // biggest at the bottom, next to the price
+  const bids = top(recent.filter(isBuy)) // biggest at the top, next to the price
+  const maxMargin = Math.max(1, ...asks.map((f) => f.margin), ...bids.map((f) => f.margin))
+  const pad = (rows) => [...Array(BOOK_ROWS - rows.length).fill(null), ...rows]
+  $('asks').innerHTML = pad(asks).map((f) => bookRow(f, 'ask', maxMargin, t)).join('')
+  $('bids').innerHTML = [...bids, ...Array(BOOK_ROWS - bids.length).fill(null)].map((f) => bookRow(f, 'bid', maxMargin, t)).join('')
+
+  const mid = mids[market]
+  // The price rolls at most once a second; at 4 updates a second its digits would never settle.
+  if (mid && Date.now() - lastMidRoll >= 1000) {
+    lastMidRoll = Date.now()
+    roll($('mid-px'), mid.toLocaleString('en-US', { minimumFractionDigits: market === 'BTC' ? 1 : 2, maximumFractionDigits: market === 'BTC' ? 1 : 2 }))
+    const then = midHistory.find((h) => h.t >= midHistory.at(-1).t - BOOK_MS)?.mids[market]
+    const bp = then ? ((mid - then) / then) * 1e4 : 0
+    const chg = $('mid-chg')
+    chg.textContent = `${bp >= 0 ? '▲' : '▼'} ${Math.abs(bp).toFixed(1)}bp`
+    chg.className = `mid-chg ${bp >= 0 ? 'up' : 'down'}`
+  }
+  const block = Math.max(0, ...blocks.keys())
+  $('mid-meta').textContent = `${market} mid${block ? ` · block #${block}` : ''}`
+}
+
+// ---- OI cap tanks ---------------------------------------------------------------------------------------------------
+const compactUsd = (v) => `$${(v / 1e6).toFixed(1)}M`
+
+function drawTanks() {
+  const m = oiLatest.markets.find((x) => x.symbol === market)
+  $('cap-title').textContent = `OI Cap · ${market}`
+  if (!m) return
+  for (const side of ['long', 'short']) {
+    const room = m[side]
+    const oi = m[`${side}Oi`]
+    const cap = m[`${side}Cap`]
+    const win = capWindows[`${market} ${side}`]
+    const used = room == null || !win ? 0 : Math.min(1, Math.max(0, 1 - room / win))
+    $(`tank-${side}`).style.width = `${(used * 100).toFixed(1)}%`
+    const el = $(`tank-${side}-room`)
+    roll(el, room == null ? 'No cap' : room < OI_FULL_USD ? 'Full' : `${money(room)} left`)
+    el.classList.toggle('tight', room != null && room < OI_TIGHT_USD)
+    $(`tank-${side}-sub`).textContent = cap == null ? `OI ${compactUsd(oi)} · no cap`
+      : `OI ${compactUsd(oi)} of ${compactUsd(cap)} cap (${((oi / cap) * 100).toFixed(1)}%) · ${Math.round(used * 100)}% of the room used`
+  }
+  $('cap-card').classList.toggle('stale', Date.now() - oiLatest.t > 30_000)
+}
+
+// ---- formatting -----------------------------------------------------------------------------------------------------
+const money = (v) => `$${Math.max(0, Math.round(v)).toLocaleString('en-US')}`
+</script>
+</body>
+</html>

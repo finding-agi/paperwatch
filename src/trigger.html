@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limit Intents</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='2' y='2' width='60' height='60' rx='14' fill='%23f4eedb' stroke='%23d9d0b8' stroke-width='2'/%3E%3Ctext x='14' y='44' font-family='ui-monospace,Menlo,monospace' font-size='40' font-weight='700' fill='%23211b14'%3Ep%3C/text%3E%3Ccircle cx='46' cy='42' r='5' fill='%23b5602c'/%3E%3C/svg%3E">
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  /* Same cream / forest-green / burnt-orange theme as paperwatch; laid out like Papertrade's trade screen. */
+  :root {
+    color-scheme: light;
+    --page: #ece6d1; --surface: #f4eedb; --raised: #fbf8f2; --ink: #211b14; --ink-2: #322f27; --label: #736c5e;
+    --grid: #e6dfc9; --border: #e1d9c2; --line: #b5602c; --green: #395e3d; --red: #8f3328;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--page); color: var(--ink-2); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1600px; margin: 0 auto; padding: 12px 16px 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 3px; padding: 14px; min-width: 0; }
+  h2 { margin: 0; color: var(--ink); font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .muted { color: var(--label); font-size: 13px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .up { color: var(--green); }
+  .down { color: var(--red); }
+  .warn { color: var(--red); }
+  .chip { padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #fff; }
+  .chip.live { background: var(--red); }
+  .chip.dry { background: var(--green); }
+  .chip.mock { background: var(--raised); color: var(--label); border: 1px solid var(--border); }
+
+  .link { font: inherit; font-size: inherit; border: 0; padding: 0; background: none; color: var(--line); cursor: pointer; text-decoration: underline; }
+  /* Enable-trading dialog. */
+  .modal { position: fixed; inset: 0; z-index: 70; background: rgba(33, 27, 20, 0.35); display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .dialog { width: 100%; max-width: 400px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 18px; display: grid; gap: 12px; box-shadow: 0 16px 40px rgba(33, 27, 20, 0.2); }
+  .dialog ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; color: var(--ink-2); }
+  .dialog .btns { display: grid; grid-template-columns: 1fr 2fr; gap: 8px; }
+  .dialog .btns button { font: inherit; font-weight: 700; padding: 11px; border-radius: 3px; cursor: pointer; }
+  .ghost { border: 1px solid var(--border); background: var(--raised); color: var(--ink-2); }
+
+  /* Layout: chart and orders on the left, account and ticket on the right. */
+  #app { display: grid; gap: 8px; align-items: start; }
+  .left, .right { display: grid; gap: 8px; min-width: 0; }
+  @media (min-width: 1000px) { #app { grid-template-columns: minmax(0, 1fr) 360px; } }
+  /* Phones: chart, then the ticket, then the account box, then the orders. */
+  @media (max-width: 999px) {
+    .left, .right { display: contents; }
+    .chart-card { order: 1; }
+    .ticket { order: 2; }
+    .acct-card { order: 3; }
+    .orders-card { order: 4; }
+  }
+
+  /* Market strip over the chart, like Papertrade's symbol / volume / OI bar. */
+  .chart-card { padding: 0; overflow: hidden; }
+  .strip { display: flex; flex-wrap: wrap; align-items: stretch; border-bottom: 1px solid var(--border); }
+  .strip > * { padding: 10px 14px; display: flex; align-items: center; gap: 8px; border-right: 1px solid var(--border); }
+  .strip .grow { flex: 1; border-right: 0; justify-content: flex-end; }
+  .sym { font-size: 18px; font-weight: 800; color: var(--ink); }
+  .px { font-size: 18px; font-weight: 600; color: var(--ink); }
+  .kv { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label); }
+  .kv b { font-size: 14px; letter-spacing: 0; color: var(--ink); margin-left: 6px; font-weight: 600; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+  .seg button { font: inherit; font-size: 13px; font-weight: 700; padding: 4px 10px; border: 0; background: transparent; color: var(--label); cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: var(--raised); color: var(--ink); }
+  #chart { height: 540px; position: relative; }
+  @media (max-width: 999px) { #chart { height: 340px; } }
+  .chart-tip { position: absolute; left: 12px; top: 10px; z-index: 3; font-size: 12px; color: var(--label); background: rgba(251, 248, 242, 0.85); padding: 3px 8px; border-radius: 3px; pointer-events: none; }
+
+  /* Account box. */
+  .acct-head { display: flex; justify-content: space-between; align-items: baseline; }
+  .acct-head b { font-size: 20px; color: var(--ink); }
+  .rows { display: grid; gap: 4px; margin-top: 10px; }
+  .lifetime { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .lifetime summary { cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label); }
+  .lifetime summary::-webkit-details-marker { display: none; }
+  .lifetime summary::after { content: '▾'; font-size: 13px; transition: transform 0.15s; }
+  .lifetime[open] summary::after { transform: rotate(180deg); }
+  .lifetime .rows { margin-top: 8px; }
+  .sub-head { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label); }
+  .sub-head:empty { margin-top: 4px; padding-top: 4px; }
+  .kvrow { display: flex; justify-content: space-between; gap: 10px; }
+  .kvrow span:first-child { color: var(--label); }
+  .kvrow span:last-child { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .kvrow span.up:last-child { color: var(--green); }
+  .kvrow span.down:last-child, .kvrow span.warn:last-child { color: var(--red); }
+
+  /* Ticket. */
+  .ticket { display: grid; gap: 12px; }
+  .side { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+  .side button { font: inherit; font-size: 15px; font-weight: 700; padding: 10px 0; border: 0; background: transparent; color: var(--label); cursor: pointer; }
+  .side button.on.long { background: var(--green); color: #fff; }
+  .side button.on.short { background: var(--red); color: #fff; }
+  .field-label { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--label); margin-bottom: 6px; }
+  .field-label span + span { text-transform: none; letter-spacing: 0; font-weight: 500; }
+  .inline { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr); gap: 6px; }
+  .mini { font: inherit; font-size: 13px; font-weight: 600; padding: 0 10px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink-2); cursor: pointer; }
+  .mini.on { border-color: var(--line); color: var(--line); }
+  input[type=number], input[type=password], select {
+    font: inherit; font-size: 16px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink); width: 100%; text-align: right; font-variant-numeric: tabular-nums;
+  }
+  input[type=password], select { text-align: left; }
+  input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+  input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=range] { width: 100%; accent-color: var(--line); margin: 8px 0 0; }
+  .range-ends { display: flex; justify-content: space-between; font-size: 12px; color: var(--label); }
+  .hint { font-size: 13px; color: var(--ink-2); background: var(--raised); border: 1px solid var(--border); border-radius: 3px; padding: 8px 10px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .pair label { display: grid; gap: 4px; font-size: 12px; color: var(--label); font-weight: 600; }
+  .pair select { font-size: 14px; padding: 7px 8px; }
+  button.go { font: inherit; font-size: 15px; font-weight: 700; padding: 12px; border: 0; border-radius: 3px; color: #fff; background: var(--green); cursor: pointer; }
+  button.go.short { background: var(--red); }
+  button.go:disabled { opacity: 0.5; cursor: default; }
+  #msg:empty { display: none; }
+
+  /* Orders panel. */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin: -4px -14px 0; padding: 0 14px; }
+  .tabs button { font: inherit; font-size: 14px; font-weight: 600; padding: 8px 10px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--label); cursor: pointer; }
+  .tabs button.on { color: var(--ink); border-bottom-color: var(--line); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th { text-align: left; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--label); padding: 10px 8px 6px; }
+  td { padding: 8px; border-top: 1px solid var(--border); vertical-align: top; white-space: nowrap; }
+  td.wrap-ok { white-space: normal; }
+  th.r, td.r { text-align: right; }
+  .status { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--label); }
+  .status.armed { color: var(--line); }
+  .status.filled { color: var(--green); }
+  .status.failed, .status.unconfirmed { color: var(--red); }
+  .note { color: var(--label); font-size: 12px; }
+  .cancel { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink-2); cursor: pointer; }
+  .table-wrap { overflow-x: auto; }
+  .credit { font-size: 11px; color: var(--label); padding: 0 2px; }
+  .credit a { color: inherit; }
+  @media (max-width: 999px) { .credit { order: 5; } }
+  @media (max-width: 640px) { .hide-sm { display: none; } }
+</style>
+</head>
+<body data-page="trigger">
+<script src="/site.js"></script>
+<div class="wrap">
+  <div class="modal" id="enable-modal" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-label="Enable trading">
+      <h2>Enable trading</h2>
+      <ul>
+        <li>Paperwatch creates a Papertrade trading key for your account. Your wallet signs once to approve it. No gas.</li>
+        <li>We use it only to open your limit intents when they trigger. Papertrade trading keys can't withdraw funds.</li>
+        <li>It lasts 30 days. Turn it off any time from the account box.</li>
+      </ul>
+      <div class="btns"><button class="ghost" id="enable-cancel">Cancel</button><button class="go" id="enable-go">Approve in wallet</button></div>
+    </div>
+  </div>
+
+  <div id="app">
+    <div class="left">
+      <div class="card chart-card">
+        <div class="strip">
+          <div><div class="seg" id="market"></div></div>
+          <div><span class="sym" id="sym">—</span><span class="px num" id="px">—</span></div>
+          <div class="kv">Long OI<b class="num" id="oi-long">—</b></div>
+          <div class="kv">Short OI<b class="num" id="oi-short">—</b></div>
+          <div class="kv hide-sm">Queue<b class="num" id="queue">—</b></div>
+          <div class="grow"><div class="seg" id="tf"><button data-v="300">5m</button><button data-v="900" class="on">15m</button><button data-v="3600">1h</button><button data-v="14400">4h</button></div><span class="chip mock" title="Hyperliquid candles (the book Papertrade prices from); the last candle follows the live mid">Hyperliquid</span></div>
+        </div>
+        <div id="chart"><div class="chart-tip" id="chart-tip">Click the chart to set the trigger price</div></div>
+      </div>
+
+      <div class="card orders-card">
+        <div class="tabs" id="tabs"><button data-v="open" class="on">Open <span id="open-count"></span></button><button data-v="history">History</button></div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Side</th><th>Market</th><th class="r">Trigger</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th>Status</th><th class="hide-sm">Detail</th><th></th></tr></thead>
+          <tbody id="orders"></tbody>
+        </table></div>
+        <div class="muted" id="orders-empty" style="padding: 12px 8px 2px;">No open limit intents.</div>
+      </div>
+      <div class="credit">Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView</a> Lightweight Charts™</div>
+    </div>
+
+    <div class="right">
+      <div class="card acct-card">
+        <div class="acct-head"><h2>Account Equity</h2><b class="num" id="equity">—</b></div>
+        <div class="rows">
+          <div class="kvrow"><span>Available to trade</span><span id="free">—</span></div>
+          <div class="kvrow"><span>Margin in use</span><span id="locked">—</span></div>
+          <div class="kvrow"><span>Open PnL</span><span id="pnl">—</span></div>
+          <div class="kvrow"><span>Open positions</span><span id="npos">—</span></div>
+          <div class="kvrow" id="queued-row" hidden><span>Queued payouts</span><span id="queued">—</span></div>
+          <div class="kvrow"><span>Trading</span><span id="acct">—</span></div>
+          <details class="lifetime">
+            <summary>Lifetime</summary>
+            <div class="rows">
+              <div class="kvrow"><span>Fees paid</span><span id="lt-fees">—</span></div>
+              <div class="kvrow"><span>Realized PnL</span><span id="lt-pnl">—</span></div>
+              <div class="kvrow"><span>Volume</span><span id="lt-volume">—</span></div>
+              <div class="kvrow"><span>Rewards claimed</span><span id="lt-claimed">—</span></div>
+              <div class="kvrow"><span>Net deposits</span><span id="lt-net">—</span></div>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <div class="card ticket">
+        <h2>Limit Intent</h2>
+        <div class="side" id="side"><button data-v="long" class="long">Long</button><button data-v="short" class="short">Short</button></div>
+
+        <div>
+          <div class="field-label"><span>Trigger price</span></div>
+          <input type="number" id="trigger" inputmode="decimal" step="any">
+        </div>
+
+        <div>
+          <div class="field-label"><span>Margin (USDC)</span><span>Available <span id="avail">—</span></span></div>
+          <div class="inline"><button class="mini" data-m="half">½×</button><button class="mini" data-m="double">2×</button><button class="mini" data-m="max">Max</button><input type="number" id="margin" inputmode="decimal" step="any" min="0"></div>
+        </div>
+
+        <div>
+          <div class="field-label"><span>Leverage</span><span id="lev-max"></span></div>
+          <div class="inline"><button class="mini" data-l="10">10×</button><button class="mini" data-l="25">25×</button><button class="mini" data-l="50">50×</button><input type="number" id="lev-in" inputmode="numeric" min="1" step="1"></div>
+          <input type="range" id="lev" min="1" max="1000" value="25">
+          <div class="range-ends"><span>×1 Safe</span><span id="lev-end">×1000</span></div>
+        </div>
+
+        <div class="rows" style="margin-top: 0;">
+          <div class="kvrow"><span>Order value</span><span id="value">—</span></div>
+          <div class="kvrow"><span>Bust price (at trigger)</span><span id="bust">—</span></div>
+          <div class="kvrow"><span>OI room on this side</span><span id="room">—</span></div>
+        </div>
+
+        <div class="pair">
+          <label>Expires<select id="expires"><option value="1">1 hour</option><option value="6">6 hours</option><option value="24" selected>24 hours</option><option value="72">3 days</option><option value="168">7 days</option></select></label>
+          <label>Max wait once sent<select id="deadline"><option value="30">30 s</option><option value="60" selected>60 s</option><option value="120">2 min</option><option value="300">5 min</option></select></label>
+        </div>
+
+        <button class="go" id="place">Place</button>
+        <div class="hint warn" id="msg"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id)
+const store = { get: (k) => { try { return localStorage.getItem(k) } catch { return null } }, set: (k, v) => { try { localStorage.setItem(k, v) } catch {} } }
+let state = null
+const form = { symbol: store.get('trigger-symbol') || 'BTC', side: 'long', touched: false, marginTouched: false, tab: 'open', tf: 900 }
+
+const money = (x, d = 2) => x == null || !Number.isFinite(x) ? '—' : (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })
+const big = (x) => x == null ? '—' : x >= 1e9 ? `$${(x / 1e9).toFixed(2)}B` : x >= 1e6 ? `$${(x / 1e6).toFixed(1)}M` : x >= 1e3 ? `$${(x / 1e3).toFixed(1)}K` : money(x, 0)
+const px = (x) => x == null ? '—' : Number(x).toLocaleString('en-US', { minimumFractionDigits: x >= 1000 ? 1 : 2, maximumFractionDigits: x >= 1000 ? 1 : 2 })
+const ago = (ms) => { const s = Math.round(Math.abs(ms) / 1000); return s < 90 ? `${s}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h` }
+
+async function api(path, body) {
+  const res = await fetch(path, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json', 'x-paperwatch': '1' }, body: body ? JSON.stringify(body) : undefined })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'request failed')
+  return data
+}
+
+const market = () => state?.markets.find((m) => m.symbol === form.symbol)
+const free = () => Math.max(0, (state?.freeUsd ?? 0) - (state?.inFlightUsd ?? 0))
+const maxMargin = () => Math.max(0, Math.floor((free() - 1) * 100) / 100)
+
+// ---- chart: our own candlesticks (lightweight-charts), on Hyperliquid candles streamed straight to the browser ----
+let chart = null, series = null, candles = [], chartKey = '', lines = []
+const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim()
+function initChart() {
+  if (chart || !window.LightweightCharts) return
+  chart = LightweightCharts.createChart($('chart'), {
+    autoSize: true,
+    // Our chart, so no TradingView logo on it; the license's attribution is the credit line under the orders.
+    layout: { background: { color: cssVar('--surface') }, textColor: cssVar('--label'), fontFamily: 'system-ui, -apple-system, sans-serif', attributionLogo: false },
+    grid: { vertLines: { color: cssVar('--grid') }, horzLines: { color: cssVar('--grid') } },
+    rightPriceScale: { borderColor: cssVar('--border') },
+    timeScale: { borderColor: cssVar('--border'), timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  })
+  const up = cssVar('--green'), down = cssVar('--red')
+  series = chart.addCandlestickSeries({ upColor: up, downColor: down, borderUpColor: up, borderDownColor: down, wickUpColor: up, wickDownColor: down })
+  // Click anywhere on the chart to use that price as the trigger.
+  chart.subscribeClick((p) => {
+    if (!p.point) return
+    const price = series.coordinateToPrice(p.point.y)
+    if (price == null) return
+    $('trigger').value = Number(price).toFixed(price >= 1000 ? 1 : 2)
+    form.touched = true
+    renderForm()
+  })
+}
+
+// History comes from our server (cached there, and kept so 5m history grows past Hyperliquid's ~17 days). Live updates
+// come straight from Hyperliquid's websocket in this browser: every trade moves the open candle, and the best
+// bid/offer drives the price in the market strip.
+const HL_INTERVAL = { 300: '5m', 900: '15m', 3600: '1h', 14400: '4h' }
+const liveMid = {}
+let hl = null, hlSubs = [], pendingLive = []
+function hlConnect() {
+  hl = new WebSocket('wss://api.hyperliquid.xyz/ws')
+  hl.onopen = () => { hlSubs = []; hlResubscribe() }
+  hl.onmessage = (e) => {
+    const m = JSON.parse(e.data)
+    if (m.channel === 'candle') onLiveCandle(m.data)
+    else if (m.channel === 'bbo') {
+      const [b, a] = m.data.bbo ?? []
+      if (!b || !a) return
+      liveMid[m.data.coin] = (Number(b.px) + Number(a.px)) / 2
+      if (m.data.coin === form.symbol) $('px').textContent = px(liveMid[m.data.coin])
+    }
+  }
+  hl.onclose = () => setTimeout(hlConnect, 2000)
+}
+setInterval(() => hl?.readyState === 1 && hl.send('{"method":"ping"}'), 30_000)
+function hlResubscribe() {
+  if (hl?.readyState !== 1) return
+  const want = [{ type: 'candle', coin: form.symbol, interval: HL_INTERVAL[form.tf] }, { type: 'bbo', coin: form.symbol }]
+  const same = (x, y) => JSON.stringify(x) === JSON.stringify(y)
+  for (const s of hlSubs) if (!want.some((w) => same(w, s))) hl.send(JSON.stringify({ method: 'unsubscribe', subscription: s }))
+  for (const s of want) if (!hlSubs.some((h) => same(h, s))) hl.send(JSON.stringify({ method: 'subscribe', subscription: s }))
+  hlSubs = want
+}
+function onLiveCandle(c) {
+  if (c.s !== form.symbol || c.i !== HL_INTERVAL[form.tf] || !series) return
+  const bar = { time: Math.floor(c.t / 1000), open: +c.o, high: +c.h, low: +c.l, close: +c.c, volume: +c.v }
+  if (candles.length) applyBar(bar)
+  else pendingLive.push(bar) // history still loading
+}
+function applyBar(bar) {
+  const last = candles.at(-1)
+  if (bar.time < last.time) return
+  if (bar.time === last.time) candles[candles.length - 1] = bar
+  else candles.push(bar)
+  series.update(bar)
+}
+async function loadCandles(key, symbol, tf) {
+  try {
+    const data = await api(`/api/candles?symbol=${symbol}&tf=${tf}`)
+    if (key !== chartKey || !data.length) return
+    candles = data.map((c) => ({ ...c }))
+    series.setData(candles)
+    for (const bar of pendingLive) applyBar(bar)
+    pendingLive = []
+    chart.timeScale().setVisibleLogicalRange({ from: candles.length - 160, to: candles.length + 4 })
+    const days = (candles.at(-1).time - candles[0].time) / 86400
+    $('chart-tip').textContent = `${candles.length} candles · ${days.toFixed(0)} days · click the chart to set the trigger price`
+  } catch (err) {
+    $('chart-tip').textContent = `Couldn't load candles: ${err.message}`
+  }
+}
+
+function renderChart() {
+  initChart()
+  const m = market()
+  if (!series || !m?.mid) return
+  const key = `${m.symbol}:${form.tf}`
+  if (key !== chartKey) {
+    chartKey = key
+    const dp = m.mid >= 1000 ? 1 : 2
+    series.applyOptions({ priceFormat: { type: 'price', precision: dp, minMove: 1 / 10 ** dp } })
+    candles = []
+    pendingLive = []
+    series.setData([])
+    $('chart-tip').textContent = 'Loading candles…'
+    loadCandles(key, m.symbol, form.tf)
+    hlResubscribe()
+  }
+  // Price lines: armed orders on this market, plus the trigger being typed.
+  for (const l of lines) series.removePriceLine(l)
+  lines = []
+  for (const o of state.orders.filter((o) => o.status === 'armed' && o.symbol === m.symbol)) {
+    lines.push(series.createPriceLine({ price: o.triggerPx, color: cssVar(o.isLong ? '--green' : '--red'), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: `${o.isLong ? 'Long' : 'Short'} ${o.when === 'below' ? '≤' : '≥'}` }))
+  }
+  const trig = Number($('trigger').value)
+  if (form.touched && trig > 0) lines.push(series.createPriceLine({ price: trig, color: cssVar('--line'), lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'New' }))
+}
+
+// ---- ticket -----------------------------------------------------------------------------------------------------------
+function renderForm() {
+  const m = market()
+  if (!m) return
+  $('market').innerHTML = state.markets.map((x) => `<button data-v="${x.symbol}" class="${x.symbol === form.symbol ? 'on' : ''}">${x.symbol}</button>`).join('')
+  for (const b of $('side').children) b.classList.toggle('on', b.dataset.v === form.side)
+  $('sym').textContent = m.symbol
+  $('px').textContent = px(liveMid[m.symbol] ?? m.mid)
+  $('oi-long').textContent = big(m.longOiUsd)
+  $('oi-short').textContent = big(m.shortOiUsd)
+
+  if (!form.touched && m.mid) $('trigger').value = m.mid.toFixed(m.mid >= 1000 ? 0 : 2)
+  if (!form.marginTouched && state.freeUsd != null) $('margin').value = Math.floor(free() / 2)
+  const sliderMax = m.maxLeverage
+  $('lev').max = sliderMax
+  $('lev-end').textContent = `×${sliderMax}`
+  $('lev-max').textContent = `max ${m.maxLeverage}×`
+  $('avail').textContent = money(free())
+
+  const trig = Number($('trigger').value)
+  const margin = Number($('margin').value)
+  const lev = Number($('lev-in').value)
+  for (const b of document.querySelectorAll('[data-l]')) b.classList.toggle('on', Number(b.dataset.l) === lev)
+
+
+  const value = margin * lev
+  $('value').textContent = margin > 0 && lev > 0 ? money(value, 0) : '—'
+  const buf = m.bustBuffer ?? 0
+  const bust = form.side === 'long' ? trig * (1 - 1 / lev) * (1 + buf) : trig * (1 + 1 / lev) * (1 - buf)
+  $('bust').textContent = trig > 0 && lev >= 1 ? px(bust) : '—'
+  const room = form.side === 'long' ? m.roomLong : m.roomShort
+  $('room').textContent = room == null ? 'uncapped' : big(room)
+  $('room').className = room != null && room < value ? 'warn' : ''
+
+  let problem = ''
+  if (stage() !== 'ready') problem = ''
+  else if (margin > maxMargin()) problem = `Only ${money(maxMargin())} can go to margin right now ($1 is kept back).`
+  else if (margin > 0 && margin < state.minMarginUsd) problem = `Minimum margin is ${money(state.minMarginUsd)}.`
+  else if (value > 0 && value < state.minNotionalUsd) problem = `Minimum position is ${money(state.minNotionalUsd, 0)}.`
+  else if (lev > m.maxLeverage) problem = `${m.symbol} max leverage is ${m.maxLeverage}×.`
+  else if (!m.openable) problem = `${m.symbol} opens are paused right now.`
+  if (!$('msg').dataset.sticky) $('msg').textContent = problem
+  const st = stage()
+  $('place').textContent = { connect: 'Connect Wallet', signin: 'Sign In', enable: 'Enable Trading', pending: 'Enabling trading…', ready: `Place ${form.side === 'long' ? 'Long' : 'Short'} Limit Intent` }[st]
+  $('place').disabled = st === 'pending' || busy
+  $('place').classList.toggle('short', st === 'ready' && form.side === 'short')
+  renderChart()
+}
+
+// ---- account and orders -----------------------------------------------------------------------------------------------
+function renderAccount() {
+  const a = state.account
+  $('equity').textContent = a ? money(a.equityUsd) : money(state.freeUsd)
+  $('free').textContent = money(state.freeUsd)
+  $('locked').textContent = a ? money(a.marginInUseUsd) : '—'
+  $('pnl').textContent = a ? (a.openPnlUsd >= 0 ? '+' : '') + money(a.openPnlUsd) : '—'
+  $('pnl').className = a ? (a.openPnlUsd >= 0 ? 'up' : 'down') : ''
+  $('npos').textContent = a ? a.positions : '—'
+  $('queued-row').hidden = !(a?.queuedUsd > 0)
+  $('queued').textContent = a ? money(a.queuedUsd) : '—'
+  // PAPER figures live in the top bar, next to the wallet button.
+  const paper = (x) => x == null ? '—' : Number(x).toLocaleString('en-US', { maximumFractionDigits: x >= 1000 ? 0 : 2 })
+  window.paperwatchWallet?.setStats(a ? [
+    { label: 'Paper', value: paper(a.paper.wallet) },
+    { label: 'Staked', value: paper(a.paper.staked) },
+    { label: 'Rewards', value: a.paper.rewardsUsd == null ? '—' : money(a.paper.rewardsUsd) },
+  ] : null)
+  const l = a?.lifetime
+  const signed = (x) => x == null ? '—' : (x > 0 ? '+' : '') + money(x)
+  $('lt-fees').textContent = l ? money(l.feesPaidUsd) : '—'
+  $('lt-pnl').textContent = l ? signed(l.realizedPnlUsd) : '—'
+  $('lt-pnl').className = l ? (l.realizedPnlUsd >= 0 ? 'up' : 'down') : ''
+  $('lt-volume').textContent = l ? big(l.tradedUsd) : '—'
+  $('lt-claimed').textContent = l ? money(l.rewardsClaimedUsd) : '—'
+  $('lt-net').textContent = l ? money(l.depositedUsd - l.withdrawnUsd) : '—'
+  const t = state.trading
+  $('acct').innerHTML = !state.view ? 'not connected' : !state.wallet ? 'off · sign in to trade'
+    : t?.status === 'active' ? `on until ${new Date(t.expiry * 1000).toLocaleDateString()} · <button class="link" id="trading-off">Turn off</button>`
+    : t?.status === 'pending' ? 'waiting for Papertrade…' : 'off'
+  $('queue').textContent = state.queued == null ? '—' : `${state.queued}${state.queued >= state.maxQueued ? ' ⚠' : ''}`
+}
+
+function renderOrders() {
+  const now = Date.now()
+  const open = state.orders.filter((o) => o.status === 'armed' || o.status === 'sending' || o.status === 'sent')
+  const list = form.tab === 'open' ? open : state.orders.filter((o) => !open.includes(o))
+  $('open-count').textContent = open.length ? `(${open.length})` : ''
+  for (const b of $('tabs').children) b.classList.toggle('on', b.dataset.v === form.tab)
+  $('orders-empty').hidden = list.length > 0
+  $('orders-empty').textContent = form.tab === 'open' ? 'No open limit intents.' : 'No history yet.'
+  $('orders').innerHTML = list.map((o) => {
+    let detail = o.status === 'armed' ? `expires in ${ago(o.expiresAt - now)}` : `placed ${ago(now - o.createdAt)} ago`
+    if (o.fill) detail = `filled @ ${px(o.fill.entryPx)} after ${o.fill.waitedS}s`
+    else if (o.firedPx) detail = `fired at ${px(o.firedPx)}`
+    const margin = o.marginUsd ?? o.fixedMarginUsd
+    return `<tr>
+      <td class="${o.isLong ? 'up' : 'down'}"><b>${o.isLong ? 'Long' : 'Short'}</b></td>
+      <td>${o.symbol}</td>
+      <td class="r">${o.when === 'below' ? '≤' : '≥'} ${px(o.triggerPx)}</td>
+      <td class="r">${margin != null ? money(margin) : `${Math.round(o.marginPct * 100)}%`}</td>
+      <td class="r hide-sm">${o.leverage}×</td>
+      <td><span class="status ${o.status}">${o.status}</span></td>
+      <td class="hide-sm wrap-ok">${detail}${o.note ? `<div class="note">${o.note.replace(/</g, '&lt;')}</div>` : ''}</td>
+      <td class="r">${o.status === 'armed' ? `<button class="cancel" data-id="${o.id}">Cancel</button>` : ''}</td>
+    </tr>`
+  }).join('')
+}
+
+function render() {
+  renderAccount()
+  renderForm()
+  renderOrders()
+}
+
+async function poll() {
+  clearTimeout(poll.t)
+  try {
+    const viewing = window.paperwatchWallet?.account
+    state = await api('/api/state' + (viewing ? `?wallet=${viewing}` : ''))
+    // Signed in as a different wallet than the one connected now (or disconnected): drop that session.
+    const browser = window.paperwatchWallet?.account
+    if (state.wallet && browser !== undefined && browser !== state.wallet && walletReady) { await api('/api/auth/logout', {}); state = await api('/api/state' + (viewing ? `?wallet=${viewing}` : '')) }
+    render()
+  } catch {}
+  poll.t = setTimeout(poll, 1000)
+}
+
+// ---- inputs -----------------------------------------------------------------------------------------------------------
+const showError = (text) => { $('msg').textContent = text; $('msg').dataset.sticky = '1'; setTimeout(() => delete $('msg').dataset.sticky, 6000) }
+$('market').onclick = (e) => { const v = e.target.dataset?.v; if (!v) return; form.symbol = v; form.touched = false; store.set('trigger-symbol', v); renderForm() }
+$('side').onclick = (e) => { const v = e.target.closest('button')?.dataset.v; if (!v) return; form.side = v; renderForm() }
+$('tf').onclick = (e) => { const v = Number(e.target.dataset?.v); if (!v) return; form.tf = v; for (const b of $('tf').children) b.classList.toggle('on', b === e.target); renderForm() }
+$('tabs').onclick = (e) => { const v = e.target.closest('button')?.dataset.v; if (!v) return; form.tab = v; renderOrders() }
+$('trigger').oninput = () => { form.touched = true; renderForm() }
+$('margin').oninput = () => { form.marginTouched = true; renderForm() }
+for (const b of document.querySelectorAll('[data-m]')) b.onclick = () => {
+  const cur = Number($('margin').value) || 0
+  const next = b.dataset.m === 'half' ? cur / 2 : b.dataset.m === 'double' ? cur * 2 : maxMargin()
+  $('margin').value = Math.min(Math.floor(next * 100) / 100, maxMargin())
+  form.marginTouched = true
+  renderForm()
+}
+const setLev = (v) => { $('lev-in').value = v; $('lev').value = Math.min(v, Number($('lev').max)); renderForm() }
+for (const b of document.querySelectorAll('[data-l]')) b.onclick = () => setLev(Number(b.dataset.l))
+$('lev').oninput = () => setLev(Number($('lev').value))
+$('lev-in').oninput = () => { $('lev').value = Math.min(Number($('lev-in').value) || 1, Number($('lev').max)); renderForm() }
+$('orders').onclick = async (e) => {
+  const id = e.target.dataset?.id
+  if (!id) return
+  try { await api(`/api/orders/${id}/cancel`, {}); poll() } catch (err) { showError(err.message) }
+}
+// ---- wallet: connect, sign in, enable trading ------------------------------------------------------------------------
+let busy = false, walletReady = false
+const W = () => window.paperwatchWallet
+function stage() {
+  const account = W()?.account
+  if (!account) return 'connect'
+  if (state?.wallet !== account) return 'signin'
+  if (state.trading?.status === 'pending') return 'pending'
+  if (state.trading?.status !== 'active') return 'enable'
+  return 'ready'
+}
+window.addEventListener('paperwatch:wallet', () => { walletReady = true; poll() })
+const walletError = (err) => err?.code === 4001 ? 'Cancelled in your wallet.' : (err?.message || String(err))
+
+async function signIn() {
+  const account = W().account
+  const { message } = await api('/api/auth/message', { wallet: account })
+  const signature = await W().provider.request({ method: 'personal_sign', params: [message, account] })
+  await api('/api/auth/verify', { wallet: account, signature })
+}
+
+async function enableTrading() {
+  await W().ensureChain() // the approval is for HyperEVM (chain 999); wallets refuse to sign it on another chain
+  const { typedData } = await api('/api/trading/prepare', {})
+  const signature = await W().provider.request({ method: 'eth_signTypedData_v4', params: [W().account, JSON.stringify(typedData)] })
+  await api('/api/trading/register', { signature })
+}
+
+async function step(fn) {
+  busy = true
+  renderForm()
+  try { await fn(); await poll() } catch (err) { showError(walletError(err)) } finally { busy = false; renderForm() }
+}
+
+$('enable-cancel').onclick = () => ($('enable-modal').hidden = true)
+$('enable-go').onclick = () => { $('enable-modal').hidden = true; step(enableTrading) }
+$('acct').onclick = async (e) => {
+  if (e.target.id !== 'trading-off') return
+  if (!confirm('Turn trading off? Your open limit intents are cancelled and Paperwatch deletes its trading key. Your wallet will then ask to revoke the key on Papertrade too (a small HyperEVM transaction, needs a little HYPE for gas).')) return
+  try {
+    const { tx } = await api('/api/trading/revoke', {})
+    poll()
+    await W().ensureChain()
+    await W().provider.request({ method: 'eth_sendTransaction', params: [{ from: W().account, to: tx.to, data: tx.data }] })
+    W().toast('Revoke sent. The key stops working once it lands.')
+  } catch (err) { showError(walletError(err)) }
+}
+
+$('place').onclick = async () => {
+  const st = stage()
+  if (st === 'connect') return W().open()
+  if (st === 'signin') return step(signIn)
+  if (st === 'enable') { $('enable-modal').hidden = false; return }
+  if (st !== 'ready') return
+  const m = market()
+  const body = { symbol: form.symbol, side: form.side, triggerPx: Number($('trigger').value), marginUsd: Number($('margin').value),
+    leverage: Number($('lev-in').value), expiresHours: Number($('expires').value), deadlineSec: Number($('deadline').value) }
+  $('place').disabled = true
+  try { await api('/api/orders', body); form.touched = false; form.tab = 'open'; poll() } catch (err) { showError(err.message) } finally { $('place').disabled = false }
+}
+
+hlConnect()
+api('/api/state').then((s) => { state = s; $('lev-in').value = s.defaultLeverage; $('lev').value = s.defaultLeverage; render(); poll.t = setTimeout(poll, 1000) }).catch(() => {})
+</script>
+</body>
+</html>

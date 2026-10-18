@@ -1,0 +1,8 @@
+node_modules/
+.env
+.secrets/
+.state/
+.DS_Store
+# Private notes: wallet, balances, strategy (kept on this machine only)
+HANDOFF.md
+RESEARCH.md

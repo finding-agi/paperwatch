@@ -1,0 +1,31 @@
+{
+  "name": "papertrade-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "status": "node --env-file-if-exists=.env src/cli.ts status",
+    "session": "node --env-file-if-exists=.env src/cli.ts session",
+    "dry": "node --env-file-if-exists=.env src/cli.ts run",
+    "live": "node --env-file-if-exists=.env src/cli.ts run --live",
+    "close-all": "node --env-file-if-exists=.env src/cli.ts close-all",
+    "watch": "node --env-file-if-exists=.env src/cli.ts watch",
+    "backtest": "node --env-file-if-exists=.env src/cli.ts backtest",
+    "restrike": "node --env-file-if-exists=.env src/cli.ts restrike",
+    "vol": "node --env-file-if-exists=.env src/cli.ts vol",
+    "queue": "node --env-file-if-exists=.env src/cli.ts queue",
+    "opener": "node --env-file-if-exists=.env src/cli.ts opener",
+    "trigger": "node --env-file-if-exists=.env src/cli.ts trigger",
+    "start": "node src/supervise.ts",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "2.56.9"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.0",
+    "typescript": "5.9.3"
+  }
+}
