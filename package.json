@@ -20,6 +20,7 @@
     "opener": "node --env-file-if-exists=.env src/cli.ts opener",
     "trigger": "node --env-file-if-exists=.env src/cli.ts trigger",
     "keys": "node src/cli.ts keys",
+    "deploy:site": "sh scripts/deploy-site.sh",
     "start": "node src/supervise.ts",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit"

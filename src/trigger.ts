@@ -816,10 +816,10 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (url.pathname === '/events') return queue.events(req, res)
       if (url.pathname === '/site.js') return serveSiteJs(res, true)
       if (url.pathname === '/healthz') {
-        // Railway's deploy-time check comes from healthcheck.railway.app; note the first one so a deploy shows it ran.
-        if (!healthSeen && String(req.headers.host ?? '').includes('healthcheck.railway.app')) {
+        // Note the first check each process answers, so a deploy's logs show Railway's health check ran.
+        if (!healthSeen) {
           healthSeen = true
-          log('health', 'Railway health check reached /healthz')
+          log('health', `first /healthz answered (host ${String(req.headers.host ?? '?').slice(0, 60)})`)
         }
         return json(res, 200, { role: ROLE, worker: holdsLock, replica: process.env.RAILWAY_REPLICA_ID?.slice(0, 8) ?? null })
       }
