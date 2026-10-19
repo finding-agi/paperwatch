@@ -614,6 +614,47 @@ function render() {
   renderOrders()
 }
 
+// ---- the account: Papertrade's own live feed, followed by this browser ---------------------------------------------
+// The same module the server uses (/account-frames.js) applies the feed's frames and builds the account box, so the
+// server opens no feed per visitor. Balances, positions, PnL and whether the trading key is on-chain all come from here.
+let frames = null
+import('/account-frames.js').then((m) => { frames = m; if (state) { enrich(); render() } })
+const feed = { wallet: null, es: null, state: null, drawn: false }
+function followAccount(wallet) {
+  if (feed.wallet === wallet || !frames) return
+  feed.es?.close()
+  Object.assign(feed, { wallet, es: null, state: null })
+  if (!wallet) return
+  const es = new EventSource(`https://exchange.papertrade.xyz/state/user/live?wallet=${encodeURIComponent(wallet)}`)
+  es.addEventListener('wallet', (e) => {
+    try {
+      feed.state = frames.applyFrame(feed.state, JSON.parse(e.data)).state
+    } catch {
+      // Out of sync (a missed patch): start over from a fresh snapshot.
+      es.close()
+      feed.wallet = null
+      return setTimeout(() => followAccount(wallet), 1000)
+    }
+    if (state && !feed.drawn) {
+      feed.drawn = true
+      requestAnimationFrame(() => { feed.drawn = false; enrich(); render() })
+    }
+  })
+  feed.es = es
+}
+// Fill in what the page now works out itself: the account box, the free balance and the trading key's status.
+function enrich() {
+  followAccount(state.view)
+  const s = frames && feed.wallet === state.view ? feed.state : null
+  state.account = s ? frames.accountBox(s, state.markets, state.closes, state.stakingContract) : null
+  state.freeUsd = s ? Number(s.availableBalance) / 1e18 : state.dryBalanceUsd ?? (state.view ? 0 : null)
+  // Until the feed's first snapshot arrives, a key the server saw land on Papertrade counts as active.
+  state.trading = !state.wallet || !frames ? null
+    : s || state.mode !== 'live' ? frames.keyStatus(state.key, s?.sessionKeys, state.mode === 'live')
+    : state.key?.registeredAt ? { status: 'active', key: state.key.address, expiry: state.key.expiry }
+    : frames.keyStatus(state.key, undefined, true)
+}
+
 async function poll() {
   clearTimeout(poll.t)
   try {
@@ -622,6 +663,7 @@ async function poll() {
     // Signed in as a different wallet than the one connected now (or disconnected): drop that session.
     const browser = window.paperwatchWallet?.account
     if (state.wallet && browser !== undefined && browser !== state.wallet && walletReady) { await api('/api/auth/logout', {}); state = await api('/api/state' + (viewing ? `?wallet=${viewing}` : '')) }
+    enrich()
     render()
     renderUnlock()
   } catch {}
@@ -741,7 +783,8 @@ $('unlock-check').onclick = () => {
 
 async function enableTrading() {
   await W().ensureChain() // the approval is for HyperEVM (chain 999); wallets refuse to sign it on another chain
-  const { typedData } = await api('/api/trading/prepare', {})
+  // renew=1: the server's stored key isn't active on Papertrade (expired or revoked there), so make a fresh one.
+  const { typedData } = await api(`/api/trading/prepare${state.key && state.trading?.status === 'none' ? '?renew=1' : ''}`, {})
   const signature = await W().provider.request({ method: 'eth_signTypedData_v4', params: [W().account, JSON.stringify(typedData)] })
   await api('/api/trading/register', { signature })
 }
@@ -779,7 +822,7 @@ $('place').onclick = async () => {
 }
 
 hlConnect()
-api('/api/state').then((s) => { state = s; $('lev-in').value = s.defaultLeverage; $('lev').value = s.defaultLeverage; render(); poll.t = setTimeout(poll, 1000) }).catch(() => {})
+api('/api/state').then((s) => { state = s; $('lev-in').value = s.defaultLeverage; $('lev').value = s.defaultLeverage; enrich(); render(); poll.t = setTimeout(poll, 1000) }).catch(() => {})
 </script>
 </body>
 </html>

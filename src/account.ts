@@ -1,4 +1,5 @@
 import type { Hex } from 'viem'
+import { OutOfSyncError, applyFrame } from './account-frames.js'
 import { API_URL, USER_AGENT } from './config.ts'
 
 export type Position = {
@@ -48,121 +49,8 @@ export type AccountState = {
 
 export type FrameResult = { state: AccountState; closed: ClosedPosition[]; outcomes: IntentOutcome[] }
 
-export class OutOfSyncError extends Error {}
-
-type Tuple = unknown[]
-type Wire = Record<string, any>
-
-export function parsePosition(t: Tuple): Position {
-  return {
-    positionId: String(t[0]),
-    instrumentId: t[1] as number,
-    isLong: t[2] as boolean,
-    useDebt: t[3] as boolean,
-    entryPriceRaw: BigInt(t[4] as string),
-    marginRaw: BigInt(t[5] as string),
-    leverage: t[6] as number,
-    bustPriceRaw: BigInt(t[7] as string),
-    openedAtMs: t[8] as number,
-    intentId: (t[9] as Hex | null) ?? null,
-  }
-}
-
-function parseClosed(t: Tuple): ClosedPosition {
-  return {
-    positionId: String(t[0]),
-    instrumentId: t[1] as number,
-    isLong: t[2] as boolean,
-    marginRaw: BigInt(t[3] as string),
-    leverage: t[4] as number,
-    liquidated: t[5] as boolean,
-    netPnlRaw: BigInt(t[6] as string),
-    paperMintedRaw: BigInt(t[7] as string),
-  }
-}
-
-// Wallet fields shared by snapshots and (partially) by patch `state` objects.
-function walletFields(w: Wire): Partial<AccountState> {
-  const out: Partial<AccountState> = {}
-  if (w.indexedThroughTimestamp !== undefined) out.indexedThroughTimestamp = w.indexedThroughTimestamp
-  if (w.sessionKeys !== undefined) {
-    out.sessionKeys = new Map((w.sessionKeys as [string, string][]).map(([k, exp]) => [k.toLowerCase(), BigInt(exp)]))
-  }
-  if (w.balance !== undefined) out.balance = BigInt(w.balance)
-  if (w.queued !== undefined) out.queued = BigInt(w.queued)
-  if (w.locked !== undefined) out.locked = BigInt(w.locked)
-  if (w.funds !== undefined) {
-    out.availableBalance = BigInt(w.funds.availableBalance)
-    out.availableQueued = BigInt(w.funds.availableQueued)
-  }
-  if (w.paper !== undefined) {
-    out.paperBalance = BigInt(w.paper.balance)
-    out.paperStaked = BigInt(w.paper.staked)
-  }
-  return out
-}
-
-const ZERO_LIFETIME: AccountState['lifetime'] = { depositedRaw: 0n, withdrawnRaw: 0n, feesPaidRaw: 0n, tradedNotionalRaw: 0n, rewardsClaimedRaw: 0n }
-function lifetimeOf(l: Wire | undefined, prev: AccountState['lifetime']): AccountState['lifetime'] {
-  if (!l) return prev
-  const big = (v: unknown, fallback: bigint) => (v === undefined || v === null ? fallback : BigInt(v as string))
-  return {
-    depositedRaw: big(l.depositedRaw, prev.depositedRaw),
-    withdrawnRaw: big(l.withdrawnRaw, prev.withdrawnRaw),
-    feesPaidRaw: big(l.feesPaidRaw, prev.feesPaidRaw),
-    tradedNotionalRaw: big(l.tradedNotionalRaw, prev.tradedNotionalRaw),
-    rewardsClaimedRaw: big(l.paperRewardsClaimedRaw, prev.rewardsClaimedRaw),
-  }
-}
-
-/** Apply one `wallet` event: a full snapshot, or a patch against the previous accountRevision. */
-export function applyFrame(prev: AccountState | null, frame: Wire): FrameResult {
-  if (frame.baseAccountRevision === undefined) {
-    const positions = new Map<string, Position>()
-    for (const t of frame.openPositions as Tuple[]) {
-      const p = parsePosition(t)
-      positions.set(p.positionId, p)
-    }
-    const state = {
-      address: String(frame.address).toLowerCase(),
-      accountRevision: frame.accountRevision,
-      ...walletFields(frame),
-      realizedPnlRaw: BigInt(frame.lifetime.realizedPnlRaw),
-      lifetime: lifetimeOf(frame.lifetime, ZERO_LIFETIME),
-      positions,
-      pendingIntents: new Set((frame.operations as Tuple[]).map((op) => op[0] as Hex)),
-    } as AccountState
-    return { state, closed: [], outcomes: [] }
-  }
-
-  if (!prev || frame.baseAccountRevision !== prev.accountRevision) throw new OutOfSyncError('account stream out of sync')
-  const positions = new Map(prev.positions)
-  for (const id of frame.removedPositionIds as string[]) positions.delete(String(id))
-  for (const t of frame.addedPositions as Tuple[]) {
-    const p = parsePosition(t)
-    positions.set(p.positionId, p)
-  }
-  const pendingIntents = new Set(prev.pendingIntents)
-  for (const id of frame.removedOperationIds as Hex[]) pendingIntents.delete(id)
-  for (const op of frame.addedOperations as Tuple[]) pendingIntents.add(op[0] as Hex)
-  const state: AccountState = {
-    ...prev,
-    ...walletFields(frame.state ?? {}),
-    accountRevision: frame.accountRevision,
-    realizedPnlRaw: frame.lifetime?.realizedPnlRaw !== undefined ? BigInt(frame.lifetime.realizedPnlRaw) : prev.realizedPnlRaw,
-    lifetime: lifetimeOf(frame.lifetime, prev.lifetime ?? ZERO_LIFETIME),
-    positions,
-    pendingIntents,
-  }
-  return {
-    state,
-    closed: ((frame.closedPositions ?? []) as Tuple[]).map(parseClosed),
-    outcomes: ((frame.intentOutcomes ?? []) as [Hex, IntentOutcome['outcome']][]).map(([intentId, outcome]) => ({
-      intentId,
-      outcome,
-    })),
-  }
-}
+// Applying frames lives in account-frames.js, which the page loads too (it follows its own account in the browser).
+export { OutOfSyncError, applyFrame, parsePosition } from './account-frames.js'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 

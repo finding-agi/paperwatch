@@ -13,6 +13,11 @@ export function serveSiteJs(res: ServerResponse, together = false): void {
   res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=31536000, immutable' }).end(js)
 }
 
+/** The account-feed module the trade page shares with the server (it follows the connected wallet's own feed). */
+export function serveAccountFrames(res: ServerResponse): void {
+  res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=31536000, immutable' }).end(readFileSync(FILES['/account-frames.js']))
+}
+
 // The chart library, served from our own origin (pinned in package.json) instead of a CDN, so no third party can
 // change the code that runs next to a connected wallet.
 const CHART_JS = join(import.meta.dirname, '..', 'node_modules', 'lightweight-charts', 'dist', 'lightweight-charts.standalone.production.js')
@@ -40,6 +45,7 @@ export function serveAsset(res: ServerResponse, name: string): boolean {
 // hash of that file (?v=…): a changed file gets a new URL, which browsers and Cloudflare fetch fresh.
 const FILES: Record<string, string> = {
   '/site.js': join(import.meta.dirname, 'site.js'),
+  '/account-frames.js': join(import.meta.dirname, 'account-frames.js'),
   '/vendor/lightweight-charts.js': CHART_JS,
   ...Object.fromEntries(Object.entries(ASSETS).map(([name, [file]]) => [`/assets/${name}`, file])),
 }
@@ -51,7 +57,7 @@ const stamp = (path: string): string =>
     : hashOf(readFileSync(FILES[path]))
 /** Add ?v=<hash of the file> to every link to one of our own files in `text` (HTML, or the site.js source). */
 export function versioned(text: string): string {
-  return text.replace(/(["'(])(\/(?:site\.js|vendor\/[\w.-]+|assets\/[\w.-]+))(["')])/g, (all, open, path, close) =>
+  return text.replace(/(["'(])(\/(?:site\.js|account-frames\.js|vendor\/[\w.-]+|assets\/[\w.-]+))(["')])/g, (all, open, path, close) =>
     Object.hasOwn(FILES, path) ? `${open}${path}?v=${stamp(path)}${close}` : all,
   )
 }
@@ -67,7 +73,7 @@ export function baseHeaders(res: ServerResponse): void {
 
 /**
  * Serve a page under a strict Content-Security-Policy: scripts only from this origin or with this response's nonce
- * (every <script> in our pages gets it), network only to this origin, Hyperliquid's websocket and its HyperEVM RPC, nothing framed.
+ * (every <script> in our pages gets it), network only to this origin, Hyperliquid's websocket and HyperEVM RPC, and Papertrade's account feed, nothing framed.
  * Injected HTML can't run script or send data anywhere else, so it can't ask a connected wallet to sign things.
  */
 export function servePage(res: ServerResponse, file: string): void {
@@ -82,7 +88,7 @@ export function servePage(res: ServerResponse, file: string): void {
       `script-src 'self' 'nonce-${nonce}'`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data:",
-      "connect-src 'self' wss://api.hyperliquid.xyz https://rpc.hyperliquid.xyz",
+      "connect-src 'self' wss://api.hyperliquid.xyz https://rpc.hyperliquid.xyz https://exchange.papertrade.xyz",
       "font-src 'self'",
       "object-src 'none'",
       "base-uri 'none'",

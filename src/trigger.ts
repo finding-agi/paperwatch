@@ -3,13 +3,14 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { encodeFunctionData, formatEther, getAddress, parseEther, verifyMessage, zeroAddress, type Address, type Hex } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { AccountStream } from './account.ts'
+import { keyStatus } from './account-frames.js'
 import { RelayerError, getTradingState, submitIntent, type Instrument, type TradingState } from './api.ts'
 import { CONTRACTS, INTENT_TTL_SEC, SESSION_TTL_SEC, USDC_UNIT } from './config.ts'
 import { EXCHANGE_DOMAIN, deadlineFromNow, intentFromSignature, signIntent, walletTypedData } from './eip712.ts'
 import { PublicStream } from './intake.ts'
 import { toPriceRaw } from './market.ts'
 import { sideHeadroomUsd } from './risk.ts'
-import { baseHeaders, serveAsset, serveChartJs, servePage, serveSiteJs } from './site.ts'
+import { baseHeaders, serveAccountFrames, serveAsset, serveChartJs, servePage, serveSiteJs } from './site.ts'
 import { startQueueRelay } from './queue-viz.ts'
 import { CandleStore } from './candles.ts'
 import { Store } from './db.ts'
@@ -47,7 +48,6 @@ const SIGN_IN_TTL_MS = 5 * 60_000 // a sign-in message must be signed within thi
 const KEY_RENEW_SEC = 3 * 86_400 // offer a fresh trading key when the current one has less than this left
 const MAX_ARMED_PER_WALLET = 20
 const IDLE_STREAM_MS = 5 * 60_000 // stop following an account with no armed orders after this long unseen
-const MAX_ACCOUNTS = 500 // account feeds open at once; past this, view-only lookups of new wallets wait
 const FAILED_OUTCOMES = new Set(['failed', 'expired', 'cancelled'])
 // Trading unlock: a one-time PT_FEE_HYPE (default 0.1) HYPE transfer on HyperEVM to PT_FEE_ADDRESS. Wallets in
 // PT_FEE_EXEMPT (comma-separated) skip it. Without PT_FEE_ADDRESS there is no fee.
@@ -231,7 +231,7 @@ function registrationError(err: RelayerError): string {
   return `Papertrade refused the trading key (${err.code}${err.reason ? `/${err.reason}` : ''}).`
 }
 
-type Account = { wallet: Address; stream: AccountStream; failed: Set<Hex>; usedAt: number; noncesChecked: boolean }
+type Account = { wallet: Address; stream: AccountStream; failed: Set<Hex>; usedAt: number }
 
 export async function runTrigger(opts: { live: boolean }): Promise<void> {
   const mode = opts.live ? 'live' : 'dry'
@@ -329,7 +329,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         for (const o of outcomes) if (FAILED_OUTCOMES.has(o.outcome)) failed.add(o.intentId)
       })
       stream.start()
-      a = { wallet: id as Address, stream, failed, usedAt: Date.now(), noncesChecked: false }
+      a = { wallet: id as Address, stream, failed, usedAt: Date.now() }
       accounts.set(id, a)
     }
     a.usedAt = Date.now()
@@ -338,7 +338,9 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   if (worker) for (const o of allOrders()) if (o.status === 'armed' || o.status === 'sent') account(o.wallet)
   setInterval(() => {
     for (const [id, a] of accounts) {
-      const busy = allOrders().some((o) => o.wallet === id && (o.status === 'armed' || o.status === 'sending' || o.status === 'sent'))
+      const busy =
+        allOrders().some((o) => o.wallet === id && (o.status === 'armed' || o.status === 'sending' || o.status === 'sent')) ||
+        [...store.closes.values()].some((c) => c.wallet === id && !c.done)
       if (!busy && Date.now() - a.usedAt > IDLE_STREAM_MS) {
         a.stream.stop()
         accounts.delete(id)
@@ -355,17 +357,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   const inFlightUsd = (wallet: Address) =>
     allOrders().filter((o) => o.wallet === wallet && (o.status === 'sending' || o.status === 'sent')).reduce((s, o) => s + (o.marginUsd ?? 0), 0)
 
-  /** Whether the wallet's trading key is usable, from the account feed (dry runs skip the on-chain part). */
-  const tradingStatus = (user: UserRecord | undefined) => {
-    const key = user?.key
-    if (!key) return { status: 'none' as const }
-    const info = { key: key.address, expiry: key.expiry }
-    if (!opts.live) return { status: 'active' as const, ...info }
-    const onChain = accounts.get(user.wallet)?.stream.state?.sessionKeys.get(key.address.toLowerCase())
-    if (onChain && Number(onChain) > Date.now() / 1000 + 3600) return { status: 'active' as const, ...info, expiry: Number(onChain) }
-    if (!key.registeredAt && Date.now() - (key.submittedAt ?? 0) < 180_000) return { status: 'pending' as const, ...info }
-    return { status: 'none' as const }
-  }
+  /** Whether the wallet's trading key is usable, from the worker's account feed (the page works it out from its own). */
+  const tradingStatus = (user: UserRecord | undefined) => keyStatus(user?.key, user && accounts.get(user.wallet)?.stream.state?.sessionKeys, opts.live)
 
   const feeOk = (wallet: Address) => !FEE_ADDRESS || FEE_EXEMPT.has(wallet.toLowerCase()) || Boolean(users.get(wallet)?.fee)
   const feeChecks = new Map<Address, number>() // last /api/fee/confirm per wallet
@@ -374,13 +367,14 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
 
   // The wallet's next intent nonce from the database counter. The first one this process uses for a wallet is checked
   // on-chain too (a counter restored from an old copy); a used one jumps to a fresh random range.
-  const nextNonce = async (wallet: Address, a: Account) => {
+  const noncesChecked = new Set<string>()
+  const nextNonce = async (wallet: Address) => {
     for (let i = 0; i < 64; i++) {
       const n = await store.takeNonce(wallet)
-      if (a.noncesChecked) return n
+      if (noncesChecked.has(wallet.toLowerCase())) return n
       const used = await client.readContract({ address: CONTRACTS.sessionKeyManager, abi: NONCE_ABI, functionName: 'isNonceUsed', args: [wallet, n] })
       if (!used) {
-        a.noncesChecked = true
+        noncesChecked.add(wallet.toLowerCase())
         return n
       }
       await store.jumpNonce(wallet)
@@ -451,7 +445,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         size: size.marginRaw,
         leverage: o.leverage,
         useDebt: false,
-        nonce: await nextNonce(o.wallet, a),
+        nonce: await nextNonce(o.wallet),
         deadline: deadlineFromNow(BigInt(o.deadlineSec)),
       })
       await store.transition(o.id, ['sending'], { intentId: signed.intentId })
@@ -550,12 +544,16 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     const user = users.get(wallet)
     if (!user?.key) return fail('Trading is not enabled.')
     const a = account(wallet)
+    const state = opts.live ? await a.stream.ready().catch(() => null) : null
+    if (opts.live && !state) return fail('Could not read the account from Papertrade. Try again.')
+    if (state && !state.positions.has(id)) return fail('That position is not open on this account.')
+    if (tradingStatus(user).status !== 'active') return fail('The trading key is not active. Enable trading again.')
     let signed: Awaited<ReturnType<typeof signIntent>>
     try {
       signed = await signIntent(privateKeyToAccount(keys.open(user.key.sealed)), EXCHANGE_DOMAIN, 'Close', {
         user: wallet,
         positionIds: [BigInt(id)],
-        nonce: await nextNonce(wallet, a),
+        nonce: await nextNonce(wallet),
         deadline: deadlineFromNow(INTENT_TTL_SEC),
       })
       await store.setClose(id, { intentId: signed.intentId })
@@ -574,6 +572,13 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     await store.setClose(id, { status: 'sent' })
     track('position_close', wallet, { positionId: id, intentId: signed.intentId })
     log('close', `${short(wallet)} #${id} sent ${signed.intentId.slice(0, 10)}`)
+    // Done once the position is gone or the close failed (the page shows "Closing…" until then, 10 minutes at most).
+    const intentId = signed.intentId
+    void a.stream
+      .waitFor((s) => (!s.positions.has(id) || a.failed.has(intentId) ? true : undefined), 10 * 60_000)
+      .then(() => store.setClose(id, a.failed.has(intentId) ? { done: true, status: 'failed', error: 'The close failed on Papertrade. Try again.' } : { done: true }))
+      .catch(() => store.setClose(id, { done: true }))
+      .catch((err) => log('warn', `close #${id}: ${errMsg(err)}`))
   }
 
   // ---- the worker: one process at a time, by the database lock -------------------------------------------------------
@@ -691,79 +696,11 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     }
     setTimeout(scanFees, FEE_SCAN_MS)
   }
-  // Account box, like Papertrade's portfolio: balances, open PnL at the live mid (before the win haircut), PAPER, and
-  // lifetime totals, all from the wallet's account feed.
-  // Closes sent from the page, by position id, until the position is gone, the close fails, or 10 minutes pass.
-  // The claims live in the database (paperwatch.closes), so two tabs or two instances can't both send one.
-  const closeError = (id: string) => {
-    const c = store.closes.get(id)
-    return c?.status === 'failed' && Date.now() - c.updatedAt < 60_000 ? c.error : null
-  }
-  const isClosing = (id: string) => {
-    const c = store.closes.get(id)
-    if (!c || c.done) return false
-    const a = accounts.get(c.wallet)
-    const done = Date.now() - c.at > 10 * 60_000 || (c.intentId && a?.failed.has(c.intentId)) || (a?.stream.state && !a.stream.state.positions.has(id))
-    if (done) {
-      c.done = true
-      void store.setClose(id, { done: true }).catch((err) => log('warn', `close #${id}: ${errMsg(err)}`))
-    }
-    return !done
-  }
-
-  const accountBox = (wallet: Address) => {
-    const s = accounts.get(wallet)?.stream.state
-    if (!s) return null
-    // Each open position at the live mid; PnL is before the win haircut Papertrade takes on close.
-    let openPnlUsd = 0
-    const open = [...s.positions.values()].map((p) => {
-      const inst = trading.instruments.find((i) => i.id === p.instrumentId)
-      const mid = inst ? midPx(inst) : null
-      const scale = Number(inst?.priceScale ?? 1)
-      const entryPx = Number(p.entryPriceRaw) / scale
-      const marginUsd = Number(p.marginRaw) / 1e18
-      const pnlUsd = mid ? marginUsd * p.leverage * ((mid.px - entryPx) / entryPx) * (p.isLong ? 1 : -1) : null
-      if (pnlUsd != null) openPnlUsd += pnlUsd
-      return {
-        id: p.positionId,
-        symbol: inst?.symbol ?? `#${p.instrumentId}`,
-        isLong: p.isLong,
-        marginUsd,
-        leverage: p.leverage,
-        sizeUsd: marginUsd * p.leverage,
-        entryPx,
-        markPx: mid?.px ?? null,
-        bustPx: Number(p.bustPriceRaw) / scale,
-        pnlUsd,
-        openedAt: p.openedAtMs,
-        closing: isClosing(p.positionId),
-        closeError: closeError(p.positionId),
-      }
-    })
-    const usdOf = (raw: bigint) => Number(raw) / 1e18
-    const balanceUsd = usdOf(s.balance)
-    const l = s.lifetime
-    return {
-      balanceUsd,
-      // The feed's balance is the free part; margin locked in open positions is still the account's, so add it back.
-      equityUsd: balanceUsd + usdOf(s.locked) + openPnlUsd,
-      marginInUseUsd: usdOf(s.locked),
-      openPnlUsd,
-      queuedUsd: usdOf(s.queued), // winnings waiting in the LP payout queue
-      positions: s.positions.size,
-      open: open.sort((a, b) => b.openedAt - a.openedAt),
-      // Claimable rewards are read by the browser straight from PaperStaking, so they cost this server no RPC calls.
-      paper: { wallet: usdOf(s.paperBalance), staked: usdOf(s.paperStaked), stakingContract: CONTRACTS.paperStaking },
-      lifetime: l && {
-        feesPaidUsd: usdOf(l.feesPaidRaw),
-        realizedPnlUsd: usdOf(s.realizedPnlRaw),
-        tradedUsd: usdOf(l.tradedNotionalRaw),
-        rewardsClaimedUsd: usdOf(l.rewardsClaimedRaw),
-        depositedUsd: usdOf(l.depositedRaw),
-        withdrawnUsd: usdOf(l.withdrawnRaw),
-      },
-    }
-  }
+  // Closes for a wallet that the page should know about: on their way, or failed within the last minute.
+  const closesFor = (wallet: Address) =>
+    [...store.closes.values()]
+      .filter((c) => c.wallet === wallet && (!c.done || (c.status === 'failed' && Date.now() - c.updatedAt < 60_000)))
+      .map((c) => ({ positionId: c.positionId, done: c.done, error: c.status === 'failed' ? c.error : null, at: c.at }))
 
   // `wallet` is who is signed in (can trade); `view` is whose account the box shows, which can be any connected wallet:
   // the account data is public on Papertrade, so it shows on connect, before signing in.
@@ -771,11 +708,14 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     mode,
     wallet,
     view,
-    trading: wallet ? tradingStatus(users.get(wallet)) : null,
+    // The page follows the account on Papertrade itself (balances, positions, whether the key is on-chain), so the server
+    // sends only what lives here: the stored key, closes on their way, orders and margin in flight.
+    key: wallet && users.get(wallet)?.key ? (({ sealed: _, ...k }) => k)(users.get(wallet)!.key!) : null,
     fee: feeInfo(wallet),
-    freeUsd: view ? freeUsd(view) : null,
     inFlightUsd: view ? inFlightUsd(view) : 0,
-    account: view ? accountBox(view) : null,
+    closes: view ? closesFor(view) : [],
+    stakingContract: CONTRACTS.paperStaking,
+    dryBalanceUsd: opts.live ? null : dryBalance,
     queued: pub.pressure?.queuedIntents ?? null,
     maxQueued: MAX_QUEUED,
     defaultLeverage: DEFAULT_LEVERAGE,
@@ -784,7 +724,9 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       .map((inst) => {
         const mid = midPx(inst)
         return {
+          id: inst.id,
           symbol: inst.symbol,
+          priceScale: String(inst.priceScale),
           mid: mid?.px ?? null,
           maxLeverage: inst.maxLeverage,
           bustBuffer: Number(inst.bustBufferRaw) / 1e18,
@@ -815,6 +757,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (['/queue', '/queue/', '/que', '/que/'].includes(url.pathname)) return queue.page(res)
       if (url.pathname === '/events') return queue.events(req, res)
       if (url.pathname === '/site.js') return serveSiteJs(res, true)
+      if (url.pathname === '/account-frames.js') return serveAccountFrames(res)
       if (url.pathname === '/healthz') {
         // Note the first check each process answers, so a deploy's logs show Railway's health check ran.
         if (!healthSeen) {
@@ -828,7 +771,6 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     // Every write needs our header: browsers won't send it cross-site without a preflight we never allow (CSRF).
     if (req.method !== 'GET' && req.headers['x-paperwatch'] !== '1') return json(res, 403, { error: 'missing request header' })
     const wallet = readToken(cookieOf(req), authSecret)
-    if (wallet) account(wallet)
     const needWallet = () => {
       if (!wallet) json(res, 401, { error: 'Connect and sign in with your wallet first.' })
       return wallet
@@ -837,12 +779,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (req.method === 'GET' && url.pathname === '/api/state') {
         if (wallet && !feeOk(wallet)) markFeeWaiting()
         const asked = url.searchParams.get('wallet')
-        let view: Address | null = wallet
-        if (!view && isAddress(asked)) {
-          view = asked.toLowerCase() as Address
-          if (accounts.has(view) || accounts.size < MAX_ACCOUNTS) account(view)
-          else view = null
-        }
+        const view: Address | null = wallet ?? (isAddress(asked) ? (asked.toLowerCase() as Address) : null)
         return json(res, 200, snapshot(wallet, view))
       }
       if (req.method === 'GET' && url.pathname === '/api/candles') {
@@ -910,9 +847,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (req.method === 'POST' && url.pathname === '/api/trading/prepare') {
         if (!needWallet() || locked()) return
         const user = await store.ensureUser(wallet!)
-        const status = tradingStatus(user)
-        if (status.status === 'active' && status.expiry > Date.now() / 1000 + KEY_RENEW_SEC) return json(res, 409, { error: 'Trading is already enabled.' })
-        const a = account(user.wallet)
+        const live = url.searchParams.get('renew') !== '1' && user.key && (user.key.registeredAt || Date.now() - (user.key.submittedAt ?? 0) < 180_000)
+        if (live && user.key!.expiry > Date.now() / 1000 + KEY_RENEW_SEC) return json(res, 409, { error: 'Trading is already enabled.' })
         const pk = generatePrivateKey()
         const keyAddress = privateKeyToAccount(pk).address
         const input = {
@@ -920,7 +856,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           key: keyAddress,
           expiry: BigInt(Math.floor(Date.now() / 1000)) + SESSION_TTL_SEC - 60n,
           feeAddress: zeroAddress, // what the official frontend sends
-          nonce: await nextNonce(user.wallet, a),
+          nonce: await nextNonce(user.wallet),
           deadline: deadlineFromNow(600n),
         }
         await store.setPendingKey(user.wallet, { address: keyAddress, sealed: keys.seal(pk), input: Object.fromEntries(Object.entries(input).map(([k, v]) => [k, String(v)])) })
@@ -950,15 +886,19 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         log('key', `${short(user.wallet)} trading key ${short(pending.address)} ${opts.live ? 'submitted' : 'approved (dry: not sent)'}`)
         if (opts.live) {
           const keyId = pending.address.toLowerCase()
-          void account(user.wallet)
-            .stream.waitFor((s) => (s.sessionKeys.has(keyId) ? true : undefined), 120_000)
+          // A short-lived feed of our own, just to see the key land on Papertrade.
+          const watch = new AccountStream(user.wallet)
+          watch.start()
+          void watch
+            .waitFor((s) => (s.sessionKeys.has(keyId) ? true : undefined), 120_000)
+            .finally(() => watch.stop())
             .then(async () => {
               await store.markKeyRegistered(user.wallet, keyId)
               log('key', `${short(user.wallet)} trading key ${short(keyId)} registered`)
             })
             .catch(() => log('warn', `${short(user.wallet)} trading key ${short(keyId)} not seen on Papertrade within 2 min`))
         }
-        return json(res, 200, tradingStatus(user))
+        return json(res, 200, keyStatus(key, undefined, opts.live))
       }
       // Turn trading off: forget the key here, and hand back the transaction that revokes it on Papertrade.
       if (req.method === 'POST' && url.pathname === '/api/trading/revoke') {
@@ -975,7 +915,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
 
       if (req.method === 'POST' && url.pathname === '/api/orders') {
         if (!needWallet() || locked()) return
-        if (tradingStatus(users.get(wallet!)).status !== 'active') return json(res, 400, { error: 'Enable trading first.' })
+        // The worker re-checks the key on-chain before sending, and holds the order if it isn't active.
+        if (!users.get(wallet!)?.key) return json(res, 400, { error: 'Enable trading first.' })
         if (allOrders().filter((o) => o.wallet === wallet && o.status === 'armed').length >= MAX_ARMED_PER_WALLET) {
           return json(res, 400, { error: `You can have up to ${MAX_ARMED_PER_WALLET} open limit intents.` })
         }
@@ -995,11 +936,9 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (req.method === 'POST' && close) {
         if (!needWallet()) return
         const user = users.get(wallet!)
-        if (!user?.key || tradingStatus(user).status !== 'active') return json(res, 400, { error: 'Enable trading first.' })
+        if (!user?.key) return json(res, 400, { error: 'Enable trading first.' })
         const id = close[1]
-        const a = account(wallet!)
-        if (!a.stream.state?.positions.has(id)) return json(res, 404, { error: 'That position is not open on this account.' })
-        if (isClosing(id)) return json(res, 409, { error: 'A close for this position is already on its way.' })
+        // The worker checks the position is this wallet's and the key is active before it sends anything.
         if (!opts.live) {
           log('close', `${short(wallet!)} #${id}: dry run, nothing sent`)
           return json(res, 200, { dry: true })
