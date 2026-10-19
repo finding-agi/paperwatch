@@ -30,7 +30,7 @@
   @font-face { font-family: 'Manrope'; font-style: normal; font-display: swap; font-weight: 200 800; src: url('/assets/manrope.woff2') format('woff2'); }
   body { font-family: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif; }
   /* The bar sits on the brand brown: light-brown and white text, orange for the call to action. */
-  .site-bar { position: sticky; top: 0; z-index: 50; background: #50413d; border-bottom: 1px solid rgba(225, 195, 187, 0.16); }
+  .site-bar { position: sticky; top: 0; z-index: 50; background: #50413d; border-bottom: 0.5px solid rgba(240, 79, 36, 0.5); } /* hairline, half-faded orange */
   .site-bar-in { max-width: 1600px; margin: 0 auto; height: 56px; padding: 0 16px; display: flex; align-items: center; gap: 22px; }
   .site-logo { display: flex; align-items: center; flex: none; }
   .site-logo img { height: 30px; width: auto; display: block; }
