@@ -146,7 +146,7 @@
           <div class="kv hide-sm">Queue<b class="num" id="queue">—</b></div>
           <div class="grow"><div class="seg" id="tf"><button data-v="300">5m</button><button data-v="900" class="on">15m</button><button data-v="3600">1h</button><button data-v="14400">4h</button></div><span class="chip mock" title="Hyperliquid candles (the book Papertrade prices from); the last candle follows the live mid">Hyperliquid</span></div>
         </div>
-        <div id="chart"><div class="chart-tip" id="chart-tip">Click the chart to set the trigger price</div></div>
+        <div id="chart"><div class="chart-tip" id="chart-tip">Click chart to set Limit Order</div></div>
       </div>
 
       <div class="card orders-card">
@@ -323,8 +323,7 @@ async function loadCandles(key, symbol, tf) {
     for (const bar of pendingLive) applyBar(bar)
     pendingLive = []
     chart.timeScale().setVisibleLogicalRange({ from: candles.length - 160, to: candles.length + 4 })
-    const days = (candles.at(-1).time - candles[0].time) / 86400
-    $('chart-tip').textContent = `${candles.length} candles · ${days.toFixed(0)} days · click the chart to set the trigger price`
+    $('chart-tip').textContent = 'Click chart to set Limit Order'
   } catch (err) {
     $('chart-tip').textContent = `Couldn't load candles: ${err.message}`
   }
@@ -342,7 +341,6 @@ function renderChart() {
     candles = []
     pendingLive = []
     series.setData([])
-    $('chart-tip').textContent = 'Loading candles…'
     loadCandles(key, m.symbol, form.tf)
     hlResubscribe()
   }
