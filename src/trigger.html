@@ -140,6 +140,8 @@
   .status.filled { color: var(--up); }
   .status.failed, .status.unconfirmed { color: var(--down); }
   .note { color: var(--label); font-size: 12px; }
+  .cancel.close-btn { border-color: var(--line); color: var(--line-text); font-weight: 700; }
+  .cancel.close-btn:disabled { opacity: 0.6; cursor: default; }
   .cancel { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink-2); cursor: pointer; }
   .table-wrap { overflow-x: auto; }
   .credit { font-size: 11px; color: rgba(225, 195, 187, 0.7); padding: 0 2px; }
@@ -481,12 +483,14 @@ function renderAccount() {
 // Open: the account's live Papertrade positions (any source). Orders: market and limit orders still waiting or in
 // flight. History: finished ones.
 const ORDER_HEAD = '<tr><th>Side</th><th>Market</th><th class="r">Price</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th>Status</th><th class="hide-sm">Detail</th><th></th></tr>'
-const POSITION_HEAD = '<tr><th>Side</th><th>Market</th><th class="r">Size</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th class="r">Entry</th><th class="r hide-sm">Mark</th><th class="r hide-sm">Bust</th><th class="r">PnL</th></tr>'
+const POSITION_HEAD = '<tr><th>Side</th><th>Market</th><th class="r">Size</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th class="r">Entry</th><th class="r hide-sm">Mark</th><th class="r hide-sm">Bust</th><th class="r">PnL</th><th></th></tr>'
 
 function renderPositions(list) {
   $('orders-head').innerHTML = POSITION_HEAD
   $('orders-empty').hidden = list.length > 0
   $('orders-empty').textContent = state.view ? 'No open positions.' : 'Connect a wallet to see its positions.'
+  // Close needs this wallet signed in with trading on (the server signs the close with its trading key).
+  const canClose = Boolean(state.wallet) && state.wallet === state.view && state.trading?.status === 'active'
   $('orders').innerHTML = list.map((p) => `<tr>
       <td class="${p.isLong ? 'up' : 'down'}"><b>${p.isLong ? 'Long' : 'Short'}</b></td>
       <td>${esc(p.symbol)}</td>
@@ -497,6 +501,7 @@ function renderPositions(list) {
       <td class="r hide-sm">${px(p.markPx)}</td>
       <td class="r hide-sm">${px(p.bustPx)}</td>
       <td class="r ${p.pnlUsd == null ? '' : p.pnlUsd >= 0 ? 'up' : 'down'}">${p.pnlUsd == null ? '—' : (p.pnlUsd >= 0 ? '+' : '') + money(p.pnlUsd)}</td>
+      <td class="r">${!canClose ? '' : p.closing ? '<span class="status armed">Closing…</span>' : `<button class="cancel close-btn" data-close="${esc(p.id)}">Close</button>`}</td>
     </tr>`).join('')
 }
 
@@ -572,6 +577,17 @@ for (const b of document.querySelectorAll('[data-l]')) b.onclick = () => setLev(
 $('lev').oninput = () => setLev(Number($('lev').value))
 $('lev-in').oninput = () => { $('lev').value = Math.min(Number($('lev-in').value) || 1, Number($('lev').max)); renderForm() }
 $('orders').onclick = async (e) => {
+  const closeId = e.target.dataset?.close
+  if (closeId) {
+    // One click, like Papertrade: the close goes out at market.
+    e.target.disabled = true
+    e.target.textContent = 'Closing…'
+    try {
+      const r = await api(`/api/positions/${closeId}/close`, {})
+      if (r.dry) W().toast('Dry run: close not sent')
+    } catch (err) { showError(err.message) }
+    return poll()
+  }
   const id = e.target.dataset?.id
   if (!id) return
   try { await api(`/api/orders/${id}/cancel`, {}); poll() } catch (err) { showError(err.message) }

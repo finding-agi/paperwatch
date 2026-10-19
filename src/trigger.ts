@@ -6,7 +6,7 @@ import { encodeFunctionData, formatEther, getAddress, parseEther, verifyMessage,
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { AccountStream } from './account.ts'
 import { RelayerError, getTradingState, submitIntent, type Instrument, type TradingState } from './api.ts'
-import { CONTRACTS, SESSION_TTL_SEC, STATE_DIR, USDC_UNIT } from './config.ts'
+import { CONTRACTS, INTENT_TTL_SEC, SESSION_TTL_SEC, STATE_DIR, USDC_UNIT } from './config.ts'
 import { EXCHANGE_DOMAIN, deadlineFromNow, intentFromSignature, signIntent, walletTypedData } from './eip712.ts'
 import { PublicStream } from './intake.ts'
 import { toPriceRaw } from './market.ts'
@@ -571,6 +571,17 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
 
   // Account box, like Papertrade's portfolio: balances, open PnL at the live mid (before the win haircut), PAPER, and
   // lifetime totals, all from the wallet's account feed.
+  // Closes sent from the page, by position id, until the position is gone, the close fails, or 10 minutes pass.
+  const closing = new Map<string, { wallet: Address; intentId: Hex | null; at: number }>()
+  const isClosing = (id: string) => {
+    const c = closing.get(id)
+    if (!c) return false
+    const a = accounts.get(c.wallet)
+    const done = Date.now() - c.at > 10 * 60_000 || (c.intentId && a?.failed.has(c.intentId)) || (a?.stream.state && !a.stream.state.positions.has(id))
+    if (done) closing.delete(id)
+    return !done
+  }
+
   const accountBox = (wallet: Address) => {
     const s = accounts.get(wallet)?.stream.state
     if (!s) return null
@@ -596,6 +607,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         bustPx: Number(p.bustPriceRaw) / scale,
         pnlUsd,
         openedAt: p.openedAtMs,
+        closing: isClosing(p.positionId),
       }
     })
     const usdOf = (raw: bigint) => Number(raw) / 1e18
@@ -841,6 +853,43 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         log('place', `${describe(o)}, expires ${new Date(o.expiresAt).toISOString()}, deadline ${o.deadlineSec}s (mid ${mid!.px})`)
         return json(res, 200, o)
       }
+      // Close one open position at market: a Papertrade Close intent signed with the wallet's trading key.
+      const close = url.pathname.match(/^\/api\/positions\/(\d+)\/close$/)
+      if (req.method === 'POST' && close) {
+        if (!needWallet()) return
+        const user = users.get(wallet!)
+        if (!user?.key || tradingStatus(user).status !== 'active') return json(res, 400, { error: 'Enable trading first.' })
+        const id = close[1]
+        const a = account(wallet!)
+        if (!a.stream.state?.positions.has(id)) return json(res, 404, { error: 'That position is not open on this account.' })
+        if (isClosing(id)) return json(res, 409, { error: 'A close for this position is already on its way.' })
+        if (!opts.live) {
+          log('close', `${short(wallet!)} #${id}: dry run, nothing sent`)
+          return json(res, 200, { dry: true })
+        }
+        const nonces = nonceSource(user)
+        if (!a.noncesChecked) {
+          await nonces.ensureUnused(client, wallet!)
+          a.noncesChecked = true
+        }
+        const signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'Close', {
+          user: wallet!,
+          positionIds: [BigInt(id)],
+          nonce: nonces.take(),
+          deadline: deadlineFromNow(INTENT_TTL_SEC),
+        })
+        try {
+          await submitIntent('closePositions', signed.signed, signed.intentId)
+        } catch (err) {
+          if (err instanceof RelayerError && err.reason === 'noOpenPositions') return json(res, 409, { error: 'A close for this position is already pending on Papertrade.' })
+          if (err instanceof RelayerError) return json(res, 400, { error: `Papertrade refused the close (${err.code}${err.reason ? `/${err.reason}` : ''}).` })
+          throw err
+        }
+        closing.set(id, { wallet: wallet!, intentId: signed.intentId, at: Date.now() })
+        log('close', `${short(wallet!)} #${id} sent ${signed.intentId.slice(0, 10)}`)
+        return json(res, 200, { intentId: signed.intentId })
+      }
+
       const cancel = url.pathname.match(/^\/api\/orders\/([\w-]+)\/cancel$/)
       if (req.method === 'POST' && cancel) {
         if (!needWallet()) return
