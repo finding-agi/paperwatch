@@ -796,7 +796,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (['/queue', '/queue/', '/que', '/que/'].includes(url.pathname)) return queue.page(res)
       if (url.pathname === '/events') return queue.events(req, res)
       if (url.pathname === '/site.js') return serveSiteJs(res, true)
-      if (url.pathname === '/healthz') return json(res, 200, { role: ROLE, worker: holdsLock })
+      if (url.pathname === '/healthz') return json(res, 200, { role: ROLE, worker: holdsLock, replica: process.env.RAILWAY_REPLICA_ID?.slice(0, 8) ?? null })
     }
     if (!url.pathname.startsWith('/api/')) return json(res, 404, { error: 'not found' })
     // Every write needs our header: browsers won't send it cross-site without a preflight we never allow (CSRF).
