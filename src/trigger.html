@@ -544,7 +544,14 @@ function renderAccount() {
     : t?.status === 'pending' ? 'waiting for Papertrade…'
     : state.fee?.required ? `locked · ${esc(state.fee.hype)} HYPE to unlock` : 'off'
   $('queue').textContent = state.queued == null ? '—' : `${state.queued}${state.queued >= state.maxQueued ? ' ⚠' : ''}`
+
+  // Closes are sent by the server's worker a moment after the click; if one failed, say why (once).
+  for (const p of state.account?.open ?? []) {
+    const key = `${p.id}:${p.closeError}`
+    if (p.closeError && !shownCloseErrors.has(key)) { shownCloseErrors.add(key); showError(p.closeError) }
+  }
 }
+const shownCloseErrors = new Set()
 
 // Open: the account's live Papertrade positions (any source). Orders: market and limit orders still waiting or in
 // flight. History: finished ones.

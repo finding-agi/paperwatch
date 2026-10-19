@@ -170,3 +170,17 @@ test('events append in order', async () => {
     { type: 'order_placed', wallet: A, data: { id: 'o1' } },
   ])
 })
+
+test('close queue: requested -> taken once -> sent or failed; a failed one frees the position', async () => {
+  const { one, two } = await pair()
+  assert.equal(await one.claimClose('7', A), true)
+  await two.refresh()
+  assert.equal(two.closes.get('7')!.status, 'requested')
+  const [x, y] = await Promise.all([one.takeClose('7'), two.takeClose('7')])
+  assert.equal(Number(Boolean(x)) + Number(Boolean(y)), 1)
+  await two.setClose('7', { status: 'failed', done: true, error: 'refused' })
+  await one.refresh()
+  assert.deepEqual([one.closes.get('7')!.status, one.closes.get('7')!.error], ['failed', 'refused'])
+  assert.equal(await one.claimClose('7', A), true)
+  assert.deepEqual([one.closes.get('7')!.status, one.closes.get('7')!.error], ['requested', null])
+})

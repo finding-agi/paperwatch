@@ -65,6 +65,9 @@ create table if not exists paperwatch.closes (
   updated_at timestamptz not null default now()
 );
 create index if not exists closes_updated on paperwatch.closes (updated_at);
+-- Closes are queued by the web instances and sent by the worker: requested -> sending -> sent, or failed (with why).
+alter table paperwatch.closes add column if not exists status text not null default 'requested';
+alter table paperwatch.closes add column if not exists error text;
 
 create table if not exists paperwatch.kv (
   id text primary key,
@@ -99,8 +102,10 @@ alter table paperwatch.events enable row level security;
 const KEEP_DONE = 50 // finished orders kept per wallet
 const REFRESH_OVERLAP_MS = 5000 // re-read rows changed this long before the last look, for writes still committing
 const CLOSE_STALE_MS = 10 * 60_000 // a close claim this old no longer blocks another close
+const WORKER_LOCK = 7_277_001 // advisory lock id: only the process holding it sends orders and closes
 
-export type Close = { positionId: string; wallet: Address; intentId: Hex | null; done: boolean; at: number }
+export type CloseStatus = 'requested' | 'sending' | 'sent' | 'failed'
+export type Close = { positionId: string; wallet: Address; intentId: Hex | null; done: boolean; status: CloseStatus; error: string | null; at: number; updatedAt: number }
 
 const time = (v: unknown) => (v == null ? undefined : new Date(v as string).getTime())
 
@@ -117,7 +122,9 @@ function toUser(r: Record<string, any>): UserRecord {
   }
 }
 
-const toClose = (r: Record<string, any>): Close => ({ positionId: r.position_id, wallet: r.wallet, intentId: r.intent_id, done: r.done, at: time(r.created_at)! })
+const toClose = (r: Record<string, any>): Close => ({
+  positionId: r.position_id, wallet: r.wallet, intentId: r.intent_id, done: r.done, status: r.status, error: r.error, at: time(r.created_at)!, updatedAt: time(r.updated_at)!,
+})
 
 /** Replace `target`'s fields with `next`'s, keeping the object (code holding it sees the change). */
 function merge<T extends object>(target: T, next: T): T {
@@ -142,11 +149,14 @@ export class Store {
   readonly orders = new Map<string, TriggerOrder>()
   readonly closes = new Map<string, Close>()
   readonly #query: Query
+  readonly #session: () => Promise<Query>
   readonly #cursor = { wallets: new Date(0), orders: new Date(0), closes: new Date(0) }
   #events: Promise<void> = Promise.resolve()
 
-  constructor(query: Query) {
+  /** `session` hands out a connection of its own (for the worker's lock); by default the shared one. */
+  constructor(query: Query, session: () => Promise<Query> = async () => query) {
     this.#query = query
+    this.#session = session
   }
 
   /**
@@ -160,7 +170,12 @@ export class Store {
       const ca = process.env.PT_DATABASE_CA
       const pool = new pg.Pool({ connectionString: url.replace(/[?&]sslmode=[^&]*/, ''), ssl: ca ? { ca } : { rejectUnauthorized: false }, max: 5 })
       pool.on('error', (err) => log('warn', `database: ${err.message}`))
-      return Store.#start(new Store((sql, params) => pool.query(sql, params)))
+      const session = async (): Promise<Query> => {
+        const client = await pool.connect() // never released: a session-level lock lives as long as this connection
+        client.on('error', (err) => log('warn', `database session: ${err.message}`))
+        return (sql, params) => client.query(sql, params)
+      }
+      return Store.#start(new Store((sql, params) => pool.query(sql, params), session))
     }
     if (deployed) throw new Error('set DATABASE_URL (deployed, the database is required)')
     const { PGlite } = await import('@electric-sql/pglite')
@@ -372,11 +387,11 @@ export class Store {
 
   // ---- closes -----------------------------------------------------------------------------------------------------
 
-  /** Claim the right to close a position; false while another close for it is on its way. */
+  /** Queue a close for the worker; false while another close for this position is on its way. */
   async claimClose(positionId: string, wallet: Address): Promise<boolean> {
     const { rows } = await this.#query(
       `insert into paperwatch.closes (position_id, wallet) values ($1, $2)
-       on conflict (position_id) do update set wallet = excluded.wallet, intent_id = null, done = false, created_at = now()
+       on conflict (position_id) do update set wallet = excluded.wallet, intent_id = null, done = false, status = 'requested', error = null, created_at = now()
          where paperwatch.closes.done or paperwatch.closes.created_at < now() - make_interval(secs => $3)
        returning *`,
       [positionId, wallet.toLowerCase(), CLOSE_STALE_MS / 1000],
@@ -385,12 +400,42 @@ export class Store {
     return Boolean(rows[0])
   }
 
-  async setClose(positionId: string, patch: { intentId?: Hex; done?: boolean }): Promise<void> {
+  /** The worker takes a requested close to send it; null if it was already taken. */
+  async takeClose(positionId: string): Promise<Close | null> {
+    const { rows } = await this.#query(`update paperwatch.closes set status = 'sending' where position_id = $1 and status = 'requested' and not done returning *`, [positionId])
+    return rows[0] ? this.#putClose(rows[0]) : null
+  }
+
+  async setClose(positionId: string, patch: { intentId?: Hex; done?: boolean; status?: CloseStatus; error?: string }): Promise<void> {
     const { rows } = await this.#query(
-      'update paperwatch.closes set intent_id = coalesce($2, intent_id), done = coalesce($3, done) where position_id = $1 returning *',
-      [positionId, patch.intentId ?? null, patch.done ?? null],
+      `update paperwatch.closes set intent_id = coalesce($2, intent_id), done = coalesce($3, done), status = coalesce($4, status), error = coalesce($5, error)
+       where position_id = $1 returning *`,
+      [positionId, patch.intentId ?? null, patch.done ?? null, patch.status ?? null, patch.error ?? null],
     )
     if (rows[0]) this.#putClose(rows[0])
+  }
+
+  // ---- the worker's lock --------------------------------------------------------------------------------------------
+
+  /**
+   * Wait until this process holds the worker lock (a Postgres session-level advisory lock), then keep checking the
+   * connection that holds it. If that connection fails the lock may be gone, so `onLost` runs (the worker exits).
+   */
+  async workerLock(onLost: (why: string) => void, retryMs = 5000): Promise<void> {
+    const q = await this.#session()
+    let waited = false
+    while (!(await q('select pg_try_advisory_lock($1) as ok', [WORKER_LOCK])).rows[0].ok) {
+      if (!waited) log('db', 'another worker holds the lock; waiting for it')
+      waited = true
+      await new Promise((ok) => setTimeout(ok, retryMs))
+    }
+    const timer = setInterval(() => {
+      q('select 1').catch((err: Error) => {
+        clearInterval(timer)
+        onLost(err.message)
+      })
+    }, 10_000)
+    timer.unref()
   }
 
   // ---- key/value and activity -------------------------------------------------------------------------------------

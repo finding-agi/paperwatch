@@ -59,6 +59,12 @@ const FEE_CHECK_MS = 3000 // one /api/fee/confirm per wallet this often; each ch
 const REVOKE_ABI = [{ type: 'function', name: 'revokeSessionKey', stateMutability: 'nonpayable', inputs: [{ type: 'address' }], outputs: [] }] as const
 const FILL_GRACE_MS = 120_000 // after the intent's deadline, how long to keep looking for its position
 const REFRESH_MS = 1000 // how often the replica pulls changed rows from the database
+// PT_ROLE: 'web' serves the pages and the API; 'worker' sends orders and closes and scans for unlock payments, and only
+// the process holding the database's worker lock does that; 'all' (the default) is both in one process.
+const ROLES = ['web', 'worker', 'all'] as const
+const ROLE = (process.env.PT_ROLE || 'all') as (typeof ROLES)[number]
+const CLOSE_PICKUP_MS = 120_000 // a queued close no worker has taken by then fails, so the button frees up
+const FEE_WAITING_MS = 10 * 60_000 // the worker scans for unlock payments while a web instance saw someone owing the fee this recently
 const PRUNE_MS = 3_600_000 // how often finished orders past the newest 50 per wallet are deleted
 const errMsg = (err: unknown) => (err instanceof Error ? err.message.split('\n')[0] : String(err))
 
@@ -233,17 +239,17 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   if (authSecret.length < 32) throw new Error('set PT_AUTH_SECRET to a random string of 32+ characters (signs sign-in cookies)')
   const keySecret = process.env.PT_KEY_SECRET || (PUBLIC || opts.live ? '' : 'local-dry-run-only-not-a-real-secret')
   if (keySecret.length < 32) throw new Error('set PT_KEY_SECRET to a random string of 32+ characters (encrypts trading keys at rest)')
+  if (!ROLES.includes(ROLE)) throw new Error(`PT_ROLE must be one of ${ROLES.join(', ')}`)
+  const web = ROLE !== 'worker'
+  const worker = ROLE !== 'web'
   // Postgres holds wallets, orders, sign-ins, closes and the activity log; reads come from the store's replica.
   const store = await Store.open(PUBLIC)
+  // The worker sends only in the mode the site runs in, so a dry worker can't "fill" live orders, or the reverse.
+  if (web) await store.put('mode', { mode })
   const users = { get: (wallet: string) => store.users.get(wallet.toLowerCase()) }
   const allOrders = () => [...store.orders.values()]
   const track = (type: string, wallet: string | null, data: Record<string, unknown> = {}) => store.event(type, wallet, data)
   const client = makeClient()
-  // A restart can't tell whether an order being sent reached the relayer: never send those again.
-  for (const o of allOrders()) {
-    if (!o.wallet && o.status === 'armed') await store.transition(o.id, ['armed'], { status: 'cancelled', note: 'placed before wallet accounts; place it again' })
-    if (o.status === 'sending') await store.transition(o.id, ['sending'], { status: 'unconfirmed', note: 'restarted while sending; check the app before placing it again' })
-  }
   let refreshing = false
   let refreshWarned = 0
   setInterval(() => {
@@ -258,7 +264,6 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       })
       .finally(() => (refreshing = false))
   }, REFRESH_MS)
-  setInterval(() => void store.pruneOrders().catch((err) => log('warn', `prune orders: ${errMsg(err)}`)), PRUNE_MS)
 
   let trading = await getTradingState()
   let tradingAt = Date.now()
@@ -324,7 +329,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     a.usedAt = Date.now()
     return a
   }
-  for (const o of allOrders()) if (o.status === 'armed' || o.status === 'sent') account(o.wallet)
+  if (worker) for (const o of allOrders()) if (o.status === 'armed' || o.status === 'sent') account(o.wallet)
   setInterval(() => {
     for (const [id, a] of accounts) {
       const busy = allOrders().some((o) => o.wallet === id && (o.status === 'armed' || o.status === 'sending' || o.status === 'sent'))
@@ -474,7 +479,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   let busy = false
   const firing = new Set<string>() // orders this process is sending, so the next pass doesn't try to claim them again
   const check = async () => {
-    if (busy) return
+    if (busy || !modeOk) return
     busy = true
     try {
       for (const o of allOrders()) {
@@ -512,7 +517,90 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       busy = false
     }
   }
-  setInterval(() => void check().catch((err) => log('warn', `check: ${errMsg(err)}`)), CHECK_MS)
+
+  // ---- closes, sent by the worker ------------------------------------------------------------------------------------
+  // A web instance queues the close (paperwatch.closes, status 'requested'); the worker takes it, signs it with the
+  // wallet's trading key and sends it. The page shows "Closing…" until the position is gone, or the reason it failed.
+  let closesBusy = false
+  const sendCloses = async () => {
+    if (closesBusy || !modeOk) return
+    closesBusy = true
+    try {
+      for (const c of [...store.closes.values()].filter((c) => c.status === 'requested' && !c.done)) {
+        if (Date.now() - c.at > CLOSE_PICKUP_MS) {
+          await store.setClose(c.positionId, { status: 'failed', done: true, error: 'The close was not sent in time. Try again.' })
+          continue
+        }
+        if (!(await store.takeClose(c.positionId))) continue
+        await sendClose(c.positionId, c.wallet).catch((err) => log('warn', `close #${c.positionId}: ${errMsg(err)}`))
+      }
+    } finally {
+      closesBusy = false
+    }
+  }
+  const sendClose = async (id: string, wallet: Address) => {
+    const fail = (error: string) => store.setClose(id, { status: 'failed', done: true, error })
+    const user = users.get(wallet)
+    if (!user?.key) return fail('Trading is not enabled.')
+    const a = account(wallet)
+    let signed: Awaited<ReturnType<typeof signIntent>>
+    try {
+      signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'Close', {
+        user: wallet,
+        positionIds: [BigInt(id)],
+        nonce: await nextNonce(wallet, a),
+        deadline: deadlineFromNow(INTENT_TTL_SEC),
+      })
+      await store.setClose(id, { intentId: signed.intentId })
+    } catch (err) {
+      return fail(`The close could not be sent (${errMsg(err)}).`) // nothing went out
+    }
+    try {
+      await submitIntent('closePositions', signed.signed, signed.intentId)
+    } catch (err) {
+      // A refusal sent nothing; anything else might have reached the relayer, so it stays "on its way".
+      if (err instanceof RelayerError && err.reason === 'noOpenPositions') return fail('A close for this position is already pending on Papertrade.')
+      if (err instanceof RelayerError) return fail(`Papertrade refused the close (${err.code}${err.reason ? `/${err.reason}` : ''}).`)
+      log('warn', `close #${id}: send failed (${errMsg(err)}); it may still land`)
+      return store.setClose(id, { status: 'sent' })
+    }
+    await store.setClose(id, { status: 'sent' })
+    track('position_close', wallet, { positionId: id, intentId: signed.intentId })
+    log('close', `${short(wallet)} #${id} sent ${signed.intentId.slice(0, 10)}`)
+  }
+
+  // ---- the worker: one process at a time, by the database lock -------------------------------------------------------
+  let holdsLock = false
+  let modeOk = true
+  const startWorker = async () => {
+    await store.workerLock((why) => {
+      // The lock may be gone with the connection: stop at once, and let the supervisor start a fresh process.
+      log('warn', `worker lock lost (${why}); exiting`)
+      process.exit(1)
+    })
+    holdsLock = true
+    log('worker', 'holding the worker lock: sending orders and closes')
+    // A restart can't tell whether an order being sent reached the relayer: never send those again.
+    for (const o of allOrders()) {
+      if (!o.wallet && o.status === 'armed') await store.transition(o.id, ['armed'], { status: 'cancelled', note: 'placed before wallet accounts; place it again' })
+      if (o.status === 'sending') await store.transition(o.id, ['sending'], { status: 'unconfirmed', note: 'restarted while sending; check the app before placing it again' })
+    }
+    for (const c of store.closes.values()) {
+      if (c.status === 'sending') await store.setClose(c.positionId, { status: 'sent' }) // may have gone out: keep blocking
+    }
+    const checkMode = async () => {
+      const site = (await store.get<{ mode: string }>('mode'))?.mode
+      const ok = !site || site === mode
+      if (ok !== modeOk) log(ok ? 'worker' : 'warn', ok ? `mode matches the site (${mode}); sending` : `this worker is ${mode} but the site is ${site}: not sending`)
+      modeOk = ok
+    }
+    await checkMode()
+    setInterval(() => void checkMode().catch((err) => log('warn', `mode check: ${errMsg(err)}`)), 10_000)
+    setInterval(() => void check().catch((err) => log('warn', `check: ${errMsg(err)}`)), CHECK_MS)
+    setInterval(() => void sendCloses().catch((err) => log('warn', `closes: ${errMsg(err)}`)), CHECK_MS)
+    setInterval(() => void store.pruneOrders().catch((err) => log('warn', `prune orders: ${errMsg(err)}`)), PRUNE_MS)
+    if (FEE_ADDRESS) void scanFees()
+  }
 
   // ---- HTTP ------------------------------------------------------------------------------------------------------------
   const json = (res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) =>
@@ -544,10 +632,18 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   // trading unlocks on its own. It looks back a minute when it starts, and the unlock window can also check a hash.
   const scanSaved = await store.get<{ block: number }>('fee-scan')
   let scanned: number | null = scanSaved ? Number(scanSaved.block) : null
-  const someoneWaiting = () =>
-    [...accounts.values()].some((a) => Date.now() - a.usedAt < 10 * 60_000 && !feeOk(a.wallet))
+  // Web instances mark "someone owes the fee" in the database, since the worker serves no pages of its own.
+  let feeWaitingUntil = 0
+  let feeWaitingMarked = 0
+  const markFeeWaiting = () => {
+    if (Date.now() - feeWaitingMarked < 60_000) return
+    feeWaitingMarked = Date.now()
+    void store.put('fee-waiting', { until: Date.now() + FEE_WAITING_MS }).catch((err) => log('warn', `fee-waiting: ${errMsg(err)}`))
+  }
+  const someoneWaiting = () => Date.now() < feeWaitingUntil
   const scanFees = async () => {
     try {
+      feeWaitingUntil = (await store.get<{ until: number }>('fee-waiting'))?.until ?? 0
       if (!someoneWaiting()) scanned = null
       else {
         const head = Number(await client.getBlockNumber())
@@ -575,11 +671,14 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     }
     setTimeout(scanFees, FEE_SCAN_MS)
   }
-  if (FEE_ADDRESS) void scanFees()
   // Account box, like Papertrade's portfolio: balances, open PnL at the live mid (before the win haircut), PAPER, and
   // lifetime totals, all from the wallet's account feed.
   // Closes sent from the page, by position id, until the position is gone, the close fails, or 10 minutes pass.
   // The claims live in the database (paperwatch.closes), so two tabs or two instances can't both send one.
+  const closeError = (id: string) => {
+    const c = store.closes.get(id)
+    return c?.status === 'failed' && Date.now() - c.updatedAt < 60_000 ? c.error : null
+  }
   const isClosing = (id: string) => {
     const c = store.closes.get(id)
     if (!c || c.done) return false
@@ -618,6 +717,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         pnlUsd,
         openedAt: p.openedAtMs,
         closing: isClosing(p.positionId),
+        closeError: closeError(p.positionId),
       }
     })
     const usdOf = (raw: bigint) => Number(raw) / 1e18
@@ -695,6 +795,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (['/queue', '/queue/', '/que', '/que/'].includes(url.pathname)) return queue.page(res)
       if (url.pathname === '/events') return queue.events(req, res)
       if (url.pathname === '/site.js') return serveSiteJs(res, true)
+      if (url.pathname === '/healthz') return json(res, 200, { role: ROLE, worker: holdsLock })
     }
     if (!url.pathname.startsWith('/api/')) return json(res, 404, { error: 'not found' })
     // Every write needs our header: browsers won't send it cross-site without a preflight we never allow (CSRF).
@@ -707,6 +808,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     }
     try {
       if (req.method === 'GET' && url.pathname === '/api/state') {
+        if (wallet && !feeOk(wallet)) markFeeWaiting()
         const asked = url.searchParams.get('wallet')
         let view: Address | null = wallet
         if (!view && isAddress(asked)) {
@@ -876,31 +978,9 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           return json(res, 200, { dry: true })
         }
         if (!(await store.claimClose(id, wallet!))) return json(res, 409, { error: 'A close for this position is already on its way.' })
-        let signed: Awaited<ReturnType<typeof signIntent>>
-        try {
-          signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'Close', {
-            user: wallet!,
-            positionIds: [BigInt(id)],
-            nonce: await nextNonce(wallet!, a),
-            deadline: deadlineFromNow(INTENT_TTL_SEC),
-          })
-          await store.setClose(id, { intentId: signed.intentId })
-        } catch (err) {
-          await store.setClose(id, { done: true }).catch(() => {}) // nothing sent: free the claim
-          throw err
-        }
-        try {
-          await submitIntent('closePositions', signed.signed, signed.intentId)
-        } catch (err) {
-          // A refusal sent nothing, so the claim is freed; anything else might have reached the relayer and keeps it.
-          if (err instanceof RelayerError) await store.setClose(id, { done: true }).catch(() => {})
-          if (err instanceof RelayerError && err.reason === 'noOpenPositions') return json(res, 409, { error: 'A close for this position is already pending on Papertrade.' })
-          if (err instanceof RelayerError) return json(res, 400, { error: `Papertrade refused the close (${err.code}${err.reason ? `/${err.reason}` : ''}).` })
-          throw err
-        }
-        track('position_close', wallet!, { positionId: id, intentId: signed.intentId })
-        log('close', `${short(wallet!)} #${id} sent ${signed.intentId.slice(0, 10)}`)
-        return json(res, 200, { intentId: signed.intentId })
+        log('close', `${short(wallet!)} #${id} queued`)
+        if (holdsLock) void sendCloses()
+        return json(res, 200, { queued: true })
       }
 
       const cancel = url.pathname.match(/^\/api\/orders\/([\w-]+)\/cancel$/)
@@ -920,8 +1000,13 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   }).listen(PORT, HOST, () => {
     const armed = allOrders().filter((o) => o.status === 'armed').length
     const fee = FEE_ADDRESS ? `unlock ${formatEther(FEE_WEI)} HYPE to ${short(FEE_ADDRESS)} (${FEE_EXEMPT.size} exempt)` : 'no unlock fee'
-    log('start', `${mode.toUpperCase()} limit intents on ${HOST}:${PORT}; ${store.users.size} account(s), ${armed} armed order(s); ${fee}; hold while ${MAX_QUEUED}+ intents queued. Opens only, never closes.`)
+    log('start', `${mode.toUpperCase()} ${ROLE} on ${HOST}:${PORT}; ${store.users.size} account(s), ${armed} armed order(s); ${fee}; hold while ${MAX_QUEUED}+ intents queued.`)
   })
+  if (worker) void startWorker().catch((err) => {
+    log('warn', `worker: ${errMsg(err)}; exiting`)
+    process.exit(1)
+  })
+  if (!web) log('start', 'worker only: the pages are served by the web instances')
 
   await new Promise<void>((resolve) => {
     process.once('SIGINT', resolve)
