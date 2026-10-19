@@ -56,8 +56,7 @@ const FEE_WEI = parseEther(process.env.PT_FEE_HYPE || '0.1')
 const FEE_SCAN_MS = 1000 // HyperEVM makes a small block every second
 const FEE_SCAN_BATCH = 6 // blocks read per pass, in parallel: catches up after a gap without hammering the RPC
 const FEE_EXEMPT = new Set((process.env.PT_FEE_EXEMPT ?? '').split(',').map((w) => w.trim().toLowerCase()).filter(Boolean))
-const PENDING_REWARD_ABI = [{ type: 'function', name: 'pendingReward', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] }] as const
-const REWARD_REFRESH_MS = 60_000
+const FEE_CHECK_MS = 3000 // one /api/fee/confirm per wallet this often; each check is two RPC reads
 const REVOKE_ABI = [{ type: 'function', name: 'revokeSessionKey', stateMutability: 'nonpayable', inputs: [{ type: 'address' }], outputs: [] }] as const
 const FILL_GRACE_MS = 120_000 // after the intent's deadline, how long to keep looking for its position
 const KEEP_DONE = 50 // finished orders kept for the page
@@ -363,6 +362,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   }
 
   const feeOk = (wallet: Address) => !FEE_ADDRESS || FEE_EXEMPT.has(wallet.toLowerCase()) || Boolean(users.get(wallet)?.fee)
+  const feeChecks = new Map<Address, number>() // last /api/fee/confirm per wallet
   const usedFeeTxs = () => new Set(users.all().flatMap((u) => (u.fee ? [u.fee.tx.toLowerCase()] : [])))
   const feeInfo = (wallet: Address | null) =>
     FEE_ADDRESS && { address: FEE_ADDRESS, hype: formatEther(FEE_WEI), valueHex: `0x${FEE_WEI.toString(16)}`, required: wallet ? !feeOk(wallet) : true }
@@ -512,8 +512,6 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   const signIns = new Map<string, { message: string; at: number }>() // wallet -> pending sign-in message
   const isAddress = (v: unknown): v is Address => typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v)
 
-  // Claimable staking rewards come from PaperStaking itself (the feed's figure lags); read at most once a minute per wallet.
-  const rewards = new Map<string, { usd: number | null; at: number; busy?: boolean }>()
   const client = makeClient()
 
   // Fee watcher: while anyone who still owes the fee has the page open, read every new HyperEVM block and credit each
@@ -555,20 +553,6 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     setTimeout(scanFees, FEE_SCAN_MS)
   }
   if (FEE_ADDRESS) void scanFees()
-  const pendingRewardUsd = (wallet: Address) => {
-    const r = rewards.get(wallet) ?? { usd: null, at: 0 }
-    rewards.set(wallet, r)
-    if (!r.busy && Date.now() - r.at > REWARD_REFRESH_MS) {
-      r.busy = true
-      client
-        .readContract({ address: CONTRACTS.paperStaking, abi: PENDING_REWARD_ABI, functionName: 'pendingReward', args: [wallet] })
-        .then((v) => Object.assign(r, { usd: Number(v) / 1e18, at: Date.now() }))
-        .catch(() => Object.assign(r, { at: Date.now() - REWARD_REFRESH_MS + 10_000 })) // retry in ~10 s
-        .finally(() => (r.busy = false))
-    }
-    return r.usd
-  }
-
   // Account box, like Papertrade's portfolio: balances, open PnL at the live mid (before the win haircut), PAPER, and
   // lifetime totals, all from the wallet's account feed.
   // Closes sent from the page, by position id, until the position is gone, the close fails, or 10 minutes pass.
@@ -622,7 +606,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       queuedUsd: usdOf(s.queued), // winnings waiting in the LP payout queue
       positions: s.positions.size,
       open: open.sort((a, b) => b.openedAt - a.openedAt),
-      paper: { wallet: usdOf(s.paperBalance), staked: usdOf(s.paperStaked), rewardsUsd: pendingRewardUsd(wallet) },
+      // Claimable rewards are read by the browser straight from PaperStaking, so they cost this server no RPC calls.
+      paper: { wallet: usdOf(s.paperBalance), staked: usdOf(s.paperStaked), stakingContract: CONTRACTS.paperStaking },
       lifetime: l && {
         feesPaidUsd: usdOf(l.feesPaidRaw),
         realizedPnlUsd: usdOf(s.realizedPnlRaw),
@@ -745,8 +730,12 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         const hash = String(body.hash ?? '')
         if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return json(res, 400, { error: 'bad transaction hash' })
         if (usedFeeTxs().has(hash.toLowerCase())) return json(res, 409, { error: 'That payment already unlocked a wallet.' })
-        const receipt = await client.waitForTransactionReceipt({ hash: hash as Hex, timeout: 90_000, pollingInterval: 1500 }).catch(() => null)
-        if (!receipt) return json(res, 202, { error: 'Payment not confirmed yet. It will be checked again shortly.' })
+        // One look per call, not a wait: the page asks again every few seconds until the payment confirms.
+        const last = feeChecks.get(wallet!) ?? 0
+        if (Date.now() - last < FEE_CHECK_MS) return json(res, 429, { error: 'Checking too often; try again in a few seconds.' })
+        feeChecks.set(wallet!, Date.now())
+        const receipt = await client.getTransactionReceipt({ hash: hash as Hex }).catch(() => null)
+        if (!receipt) return json(res, 202, { pending: true, error: 'Payment not confirmed yet.' })
         const tx = await client.getTransaction({ hash: hash as Hex })
         const problem = feePaymentProblem(tx, receipt.status, wallet!, FEE_ADDRESS!, FEE_WEI)
         if (problem) return json(res, 400, { error: problem })

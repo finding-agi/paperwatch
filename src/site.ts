@@ -67,7 +67,7 @@ export function baseHeaders(res: ServerResponse): void {
 
 /**
  * Serve a page under a strict Content-Security-Policy: scripts only from this origin or with this response's nonce
- * (every <script> in our pages gets it), network only to this origin and Hyperliquid's websocket, nothing framed.
+ * (every <script> in our pages gets it), network only to this origin, Hyperliquid's websocket and its HyperEVM RPC, nothing framed.
  * Injected HTML can't run script or send data anywhere else, so it can't ask a connected wallet to sign things.
  */
 export function servePage(res: ServerResponse, file: string): void {
@@ -82,7 +82,7 @@ export function servePage(res: ServerResponse, file: string): void {
       `script-src 'self' 'nonce-${nonce}'`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data:",
-      "connect-src 'self' wss://api.hyperliquid.xyz",
+      "connect-src 'self' wss://api.hyperliquid.xyz https://rpc.hyperliquid.xyz",
       "font-src 'self'",
       "object-src 'none'",
       "base-uri 'none'",

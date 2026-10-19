@@ -165,7 +165,8 @@
       <h3>Unlock trading <button type="button" id="unlock-x" aria-label="Close">×</button></h3>
       <div class="unlock-text">Send <b><span id="unlock-amount">0.1</span> HYPE</b> to this address to unlock.</div>
       <div class="unlock-addr"><code id="unlock-address"></code><button type="button" class="mini" id="unlock-copy">Copy</button></div>
-      <div class="fine">Send it on HyperEVM from your connected wallet, <b id="unlock-from"></b>. Trading unlocks on its own once it confirms.</div>
+      <button type="button" class="go" id="unlock-pay">Pay from my wallet</button>
+      <div class="fine">Send it on HyperEVM from your connected wallet, <b id="unlock-from"></b>. Or send it yourself; trading unlocks on its own once it confirms.</div>
       <div class="unlock-status" id="unlock-status">Waiting for your payment…</div>
       <details class="unlock-hash">
         <summary>Already sent? Check a transaction</summary>
@@ -492,6 +493,25 @@ function renderForm() {
   renderChart()
 }
 
+// Claimable PAPER staking rewards, read by this browser straight from PaperStaking on HyperEVM's public RPC (at most
+// once a minute per wallet), so the rate limit falls on each visitor rather than on our server.
+const rewards = new Map()
+function rewardUsd(wallet, contract) {
+  if (!wallet || !contract) return null
+  const r = rewards.get(wallet) ?? { usd: null, at: 0 }
+  rewards.set(wallet, r)
+  if (!r.busy && Date.now() - r.at > 60_000) {
+    r.busy = true
+    const data = '0xf40f0f52' + wallet.slice(2).toLowerCase().padStart(64, '0') // pendingReward(address)
+    fetch('https://rpc.hyperliquid.xyz/evm', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: contract, data }, 'latest'] }) })
+      .then((res) => res.json())
+      .then(({ result }) => { if (!/^0x[0-9a-f]+$/i.test(result ?? '')) throw new Error('bad reply'); Object.assign(r, { usd: Number(BigInt(result)) / 1e18, at: Date.now() }); renderAccount() })
+      .catch(() => (r.at = Date.now() - 50_000)) // retry in ~10 s
+      .finally(() => (r.busy = false))
+  }
+  return r.usd
+}
+
 // ---- account and orders -----------------------------------------------------------------------------------------------
 function renderAccount() {
   const a = state.account
@@ -508,7 +528,7 @@ function renderAccount() {
   window.paperwatchWallet?.setStats(a ? [
     { label: 'Paper', value: paper(a.paper.wallet) },
     { label: 'Staked', value: paper(a.paper.staked) },
-    { label: 'Rewards', value: a.paper.rewardsUsd == null ? '—' : money(a.paper.rewardsUsd) },
+    { label: 'Rewards', value: money(rewardUsd(state.view, a.paper.stakingContract)) },
   ] : null)
   const l = a?.lifetime
   const signed = (x) => x == null ? '—' : (x > 0 ? '+' : '') + money(x)
@@ -684,11 +704,32 @@ function renderUnlock() {
 $('unlock-x').onclick = () => ($('unlock-modal').hidden = true)
 $('unlock-modal').onclick = (e) => { if (e.target.id === 'unlock-modal') $('unlock-modal').hidden = true }
 $('unlock-copy').onclick = () => navigator.clipboard?.writeText(state.fee.address).then(() => W().toast('Address copied'))
-// Fallback if the watcher missed it: check a specific transaction.
-$('unlock-check').onclick = async () => {
-  const hash = $('unlock-hash').value.trim()
+// Check one payment by its hash, asking again every few seconds (for up to two minutes) until it confirms.
+async function confirmFee(hash) {
+  for (let i = 0; i < 40; i++) {
+    let r
+    try { r = await api('/api/fee/confirm', { hash }) } catch (err) {
+      if (/too often/.test(err.message)) { await new Promise((ok) => setTimeout(ok, 3000)); continue }
+      $('unlock-status').textContent = err.message
+      return
+    }
+    if (!r.pending) return poll()
+    $('unlock-status').textContent = 'Payment sent. Waiting for it to confirm…'
+    await new Promise((ok) => setTimeout(ok, 3000))
+  }
+  $('unlock-status').textContent = 'Still not confirmed. Trading unlocks on its own once it is.'
+}
+$('unlock-pay').onclick = async () => {
+  try {
+    await W().ensureChain()
+    const hash = await W().provider.request({ method: 'eth_sendTransaction', params: [{ from: W().account, to: state.fee.address, value: state.fee.valueHex }] })
+    await confirmFee(hash)
+  } catch (err) { $('unlock-status').textContent = err?.code === 4001 ? 'Payment cancelled.' : (err?.message ?? 'Payment failed.') }
+}
+// Sent it some other way: check that transaction.
+$('unlock-check').onclick = () => {
   $('unlock-status').textContent = 'Checking that transaction…'
-  try { await api('/api/fee/confirm', { hash }); await poll() } catch (err) { $('unlock-status').textContent = err.message }
+  return confirmFee($('unlock-hash').value.trim())
 }
 
 async function enableTrading() {
