@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { zeroAddress, type Hex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { AccountStream } from './account.ts'
@@ -16,6 +18,7 @@ import { runIntakeMonitor } from './intake.ts'
 import { runQueueView } from './queue-viz.ts'
 import { runOpener } from './opener.ts'
 import { runTrigger } from './trigger.ts'
+import { newKeyPair } from './keyring.ts'
 import { NonceSource, createSessionKey, loadSessionKey, loadState, saveState } from './state.ts'
 
 const M = (x: number) => `${usd(x / 1e6, 2)}M`
@@ -182,10 +185,21 @@ const HELP = `usage: npm run <command>
   opener      open ONE long + short pair now (--live to send), then do nothing: never closes or resets
   trigger     page at http://localhost:8788 for opens that fire when Hyperliquid's mid crosses your price (--live to send)
   close-all   close EVERY open position on the account, including ones the bot didn't open
+  keys <dir>  new trading-key seal pair: prints PT_KEY_PUBLIC, writes PT_KEY_PRIVATE to <dir>/trading-key-<kid>.private
 
 Config lives in .env (see .env.example).`
 
 const [cmd, ...args] = process.argv.slice(2)
+
+/** A seal key pair for trading keys. The private half goes to a file (owner-only), never to the terminal. */
+async function newTradingKeyPair(dir: string | undefined): Promise<void> {
+  if (!dir) throw new Error('usage: npm run keys -- <dir>')
+  const { kid, publicKey, privateKey } = newKeyPair()
+  mkdirSync(dir, { recursive: true })
+  const file = join(dir, `trading-key-${kid}.private`)
+  writeFileSync(file, privateKey, { mode: 0o600, flag: 'wx' })
+  console.log(`kid ${kid}\nPT_KEY_PUBLIC=${publicKey}\nPT_KEY_PRIVATE is in ${file} (set it on the worker only, then delete the file)`)
+}
 const commands: Record<string, () => Promise<void>> = {
   status,
   session,
@@ -199,6 +213,7 @@ const commands: Record<string, () => Promise<void>> = {
   backtest: () => runBacktest(args),
   restrike: () => runRestrikeBacktest(args),
   vol: () => runVol(args),
+  keys: () => newTradingKeyPair(args[0]),
 }
 
 const fn = cmd ? commands[cmd] : undefined

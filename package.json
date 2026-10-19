@@ -19,6 +19,7 @@
     "queue": "node --env-file-if-exists=.env src/cli.ts queue",
     "opener": "node --env-file-if-exists=.env src/cli.ts opener",
     "trigger": "node --env-file-if-exists=.env src/cli.ts trigger",
+    "keys": "node src/cli.ts keys",
     "start": "node src/supervise.ts",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit"

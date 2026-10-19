@@ -327,6 +327,14 @@ export class Store {
     )
   }
 
+  /** Swap a sealed trading key (or pending key) for the same key sealed again, only if it is still `from`. */
+  async reseal(wallet: Address, which: 'key' | 'pending', from: string, to: string): Promise<boolean> {
+    const done = which === 'key'
+      ? await this.#updateUser(wallet, 'key_sealed = $3', [from, to], 'and key_sealed = $2')
+      : await this.#updateUser(wallet, "pending_key = jsonb_set(pending_key, '{sealed}', to_jsonb($3::text))", [from, to], "and pending_key->>'sealed' = $2")
+    return Boolean(done)
+  }
+
   async markKeyRegistered(wallet: Address, keyAddress: string): Promise<void> {
     await this.#updateUser(wallet, 'key_registered_at = now()', [keyAddress.toLowerCase()], 'and lower(key_address) = $2')
   }

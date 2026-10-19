@@ -14,7 +14,8 @@ import { startQueueRelay } from './queue-viz.ts'
 import { CandleStore } from './candles.ts'
 import { Store } from './db.ts'
 import { NONCE_ABI } from './state.ts'
-import { issueToken, openKey, readToken, sealKey, signInMessage, type UserRecord } from './users.ts'
+import { Keyring } from './keyring.ts'
+import { issueToken, readToken, signInMessage, type UserRecord } from './users.ts'
 import { log, makeClient, usd } from './bot.ts'
 
 // Limit Intents (its own Railway service, PT_PROCESS=trigger), a public page where anyone can place orders like "long
@@ -237,8 +238,13 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   // Deployed (or live), both secrets are required: one signs sign-in cookies, the other encrypts trading keys at rest.
   const authSecret = process.env.PT_AUTH_SECRET || (PUBLIC || opts.live ? '' : 'local-dry-run-only-auth-secret-not-real') // stable locally, so a restart keeps you signed in
   if (authSecret.length < 32) throw new Error('set PT_AUTH_SECRET to a random string of 32+ characters (signs sign-in cookies)')
-  const keySecret = process.env.PT_KEY_SECRET || (PUBLIC || opts.live ? '' : 'local-dry-run-only-not-a-real-secret')
-  if (keySecret.length < 32) throw new Error('set PT_KEY_SECRET to a random string of 32+ characters (encrypts trading keys at rest)')
+  // Trading keys at rest (src/keyring.ts): web seals with PT_KEY_PUBLIC, the worker opens with PT_KEY_PRIVATE. The old
+  // PT_KEY_SECRET still works for both until it is removed; locally a fixed dry-run secret stands in.
+  if (process.env.PT_KEY_SECRET && process.env.PT_KEY_SECRET.length < 32) throw new Error('PT_KEY_SECRET must be 32+ characters')
+  const keys = Keyring.fromEnv(process.env, PUBLIC || opts.live ? undefined : 'local-dry-run-only-not-a-real-secret')
+  if (ROLE !== 'worker' && !keys.canSeal) throw new Error('set PT_KEY_PUBLIC (seals new trading keys)')
+  if (ROLE !== 'web' && !keys.canOpen) throw new Error('set PT_KEY_PRIVATE (opens trading keys to send orders)')
+  log('keys', `seals with ${keys.kid ?? (keys.canSeal ? 'PT_KEY_SECRET' : 'nothing')}; opens ${ROLE === 'web' && keys.opens.length ? `${keys.opens.join(', ')} (a web instance needs none)` : keys.opens.join(', ') || 'nothing'}`)
   if (!ROLES.includes(ROLE)) throw new Error(`PT_ROLE must be one of ${ROLES.join(', ')}`)
   const web = ROLE !== 'worker'
   const worker = ROLE !== 'web'
@@ -438,7 +444,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     if (!claimed) return
     let signed: Awaited<ReturnType<typeof signIntent>>
     try {
-      signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'OpenPosition', {
+      signed = await signIntent(privateKeyToAccount(keys.open(user.key.sealed)), EXCHANGE_DOMAIN, 'OpenPosition', {
         user: o.wallet,
         instrumentId: inst.id,
         isLong: o.isLong,
@@ -546,7 +552,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     const a = account(wallet)
     let signed: Awaited<ReturnType<typeof signIntent>>
     try {
-      signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'Close', {
+      signed = await signIntent(privateKeyToAccount(keys.open(user.key.sealed)), EXCHANGE_DOMAIN, 'Close', {
         user: wallet,
         positionIds: [BigInt(id)],
         nonce: await nextNonce(wallet, a),
@@ -589,6 +595,18 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     for (const c of store.closes.values()) {
       if (c.status === 'sending') await store.setClose(c.positionId, { status: 'sent' }) // may have gone out: keep blocking
     }
+    // Move every sealed key to the current public key (after a rotation, or off PT_KEY_SECRET); keys sealed the old way
+    // by a web instance still on it get picked up on the next pass.
+    const rewrap = async () => {
+      let n = 0
+      for (const u of [...store.users.values()]) {
+        if (u.key && keys.needsRewrap(u.key.sealed) && (await store.reseal(u.wallet, 'key', u.key.sealed, keys.seal(keys.open(u.key.sealed))))) n++
+        if (u.pendingKey && keys.needsRewrap(u.pendingKey.sealed) && (await store.reseal(u.wallet, 'pending', u.pendingKey.sealed, keys.seal(keys.open(u.pendingKey.sealed))))) n++
+      }
+      if (n) log('keys', `resealed ${n} trading key(s) with ${keys.kid}`)
+    }
+    await rewrap().catch((err) => log('warn', `rewrap: ${errMsg(err)}`))
+    setInterval(() => void rewrap().catch((err) => log('warn', `rewrap: ${errMsg(err)}`)), 60_000)
     const checkMode = async () => {
       const site = (await store.get<{ mode: string }>('mode'))?.mode
       const ok = !site || site === mode
@@ -897,7 +915,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           nonce: await nextNonce(user.wallet, a),
           deadline: deadlineFromNow(600n),
         }
-        await store.setPendingKey(user.wallet, { address: keyAddress, sealed: sealKey(pk, keySecret), input: Object.fromEntries(Object.entries(input).map(([k, v]) => [k, String(v)])) })
+        await store.setPendingKey(user.wallet, { address: keyAddress, sealed: keys.seal(pk), input: Object.fromEntries(Object.entries(input).map(([k, v]) => [k, String(v)])) })
         return json(res, 200, { typedData: walletTypedData(EXCHANGE_DOMAIN, 'RegisterSessionKey', input), key: keyAddress })
       }
       if (req.method === 'POST' && url.pathname === '/api/trading/register') {
