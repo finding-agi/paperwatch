@@ -14,16 +14,20 @@ import type { UserRecord } from './users.ts'
 // unlocks one wallet), so several server instances can share it safely. Each instance keeps a replica in memory for
 // reads, refreshed from rows changed since its last look; its own writes land in the replica straight away.
 
+/** The Postgres schema (PT_DB_SCHEMA, default paperwatch): a load test uses its own, next to production's. */
+const S = process.env.PT_DB_SCHEMA || 'paperwatch'
+if (!/^[a-z_][a-z0-9_]*$/.test(S)) throw new Error('PT_DB_SCHEMA must be a plain lowercase name')
+
 export type Query = (sql: string, params?: unknown[]) => Promise<{ rows: Record<string, any>[] }>
 
 // The live project also revokes every privilege on this schema from Supabase's public API roles (anon, authenticated);
 // see the paperwatch_initial migration. Only the server's own Postgres login can read the sealed keys.
 export const SCHEMA = `
-create schema if not exists paperwatch;
-create or replace function paperwatch.touch() returns trigger language plpgsql set search_path = '' as $$
+create schema if not exists ${S};
+create or replace function ${S}.touch() returns trigger language plpgsql set search_path = '' as $$
 begin new.updated_at = now(); return new; end $$;
 
-create table if not exists paperwatch.wallets (
+create table if not exists ${S}.wallets (
   wallet text primary key,
   created_at timestamptz not null default now(),
   next_nonce numeric not null,
@@ -38,25 +42,25 @@ create table if not exists paperwatch.wallets (
   fee_wei numeric,
   updated_at timestamptz not null default now()
 );
-create index if not exists wallets_updated on paperwatch.wallets (updated_at);
+create index if not exists wallets_updated on ${S}.wallets (updated_at);
 
-create table if not exists paperwatch.orders (
+create table if not exists ${S}.orders (
   id text primary key,
   data jsonb not null,
   wallet text generated always as (data->>'wallet') stored,
   status text generated always as (data->>'status') stored,
   updated_at timestamptz not null default now()
 );
-create index if not exists orders_wallet on paperwatch.orders (wallet);
-create index if not exists orders_updated on paperwatch.orders (updated_at);
+create index if not exists orders_wallet on ${S}.orders (wallet);
+create index if not exists orders_updated on ${S}.orders (updated_at);
 
-create table if not exists paperwatch.sign_ins (
+create table if not exists ${S}.sign_ins (
   wallet text primary key,
   message text not null,
   created_at timestamptz not null default now()
 );
 
-create table if not exists paperwatch.closes (
+create table if not exists ${S}.closes (
   position_id text primary key,
   wallet text not null,
   intent_id text,
@@ -64,39 +68,39 @@ create table if not exists paperwatch.closes (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-create index if not exists closes_updated on paperwatch.closes (updated_at);
+create index if not exists closes_updated on ${S}.closes (updated_at);
 -- Closes are queued by the web instances and sent by the worker: requested -> sending -> sent, or failed (with why).
-alter table paperwatch.closes add column if not exists status text not null default 'requested';
-alter table paperwatch.closes add column if not exists error text;
+alter table ${S}.closes add column if not exists status text not null default 'requested';
+alter table ${S}.closes add column if not exists error text;
 
-create table if not exists paperwatch.kv (
+create table if not exists ${S}.kv (
   id text primary key,
   data jsonb not null,
   updated_at timestamptz not null default now()
 );
-create table if not exists paperwatch.events (
+create table if not exists ${S}.events (
   id bigserial primary key,
   at timestamptz not null default now(),
   wallet text,
   type text not null,
   data jsonb not null default '{}'
 );
-create index if not exists events_wallet_at on paperwatch.events (wallet, at);
-create index if not exists events_type_at on paperwatch.events (type, at);
+create index if not exists events_wallet_at on ${S}.events (wallet, at);
+create index if not exists events_type_at on ${S}.events (type, at);
 
-drop trigger if exists wallets_touch on paperwatch.wallets;
-create trigger wallets_touch before update on paperwatch.wallets for each row execute function paperwatch.touch();
-drop trigger if exists orders_touch on paperwatch.orders;
-create trigger orders_touch before update on paperwatch.orders for each row execute function paperwatch.touch();
-drop trigger if exists closes_touch on paperwatch.closes;
-create trigger closes_touch before update on paperwatch.closes for each row execute function paperwatch.touch();
+drop trigger if exists wallets_touch on ${S}.wallets;
+create trigger wallets_touch before update on ${S}.wallets for each row execute function ${S}.touch();
+drop trigger if exists orders_touch on ${S}.orders;
+create trigger orders_touch before update on ${S}.orders for each row execute function ${S}.touch();
+drop trigger if exists closes_touch on ${S}.closes;
+create trigger closes_touch before update on ${S}.closes for each row execute function ${S}.touch();
 
-alter table paperwatch.wallets enable row level security;
-alter table paperwatch.orders enable row level security;
-alter table paperwatch.sign_ins enable row level security;
-alter table paperwatch.closes enable row level security;
-alter table paperwatch.kv enable row level security;
-alter table paperwatch.events enable row level security;
+alter table ${S}.wallets enable row level security;
+alter table ${S}.orders enable row level security;
+alter table ${S}.sign_ins enable row level security;
+alter table ${S}.closes enable row level security;
+alter table ${S}.kv enable row level security;
+alter table ${S}.events enable row level security;
 `
 
 const KEEP_DONE = 50 // finished orders kept per wallet
@@ -105,7 +109,9 @@ const CLOSE_STALE_MS = 10 * 60_000 // a close claim this old no longer blocks an
 // Connections per process. Supabase's free session pooler takes ~15 clients in all: 2 web replicas + the worker
 // (its pool plus the lock's own connection) stay near 10.
 const POOL_MAX = Number(process.env.PT_DB_POOL_MAX ?? 3)
-const WORKER_LOCK = 7_277_001 // advisory lock id: only the process holding it sends orders and closes
+// Advisory lock id: only the process holding it sends orders and closes. Per schema, so a load test's worker in the
+// same database never takes production's lock (production keeps 7277001).
+const WORKER_LOCK = S === 'paperwatch' ? 7_277_001 : 7_277_001 + 1 + [...S].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1_000_000, 0)
 
 export type CloseStatus = 'requested' | 'sending' | 'sent' | 'failed'
 export type Close = { positionId: string; wallet: Address; intentId: Hex | null; done: boolean; status: CloseStatus; error: string | null; at: number; updatedAt: number }
@@ -200,19 +206,19 @@ export class Store {
   }
 
   /**
-   * One time, into empty tables: wallets from the first database version (paperwatch.users, one JSON blob per wallet)
+   * One time, into empty tables: wallets from the first database version (<schema>.users, one JSON blob per wallet)
    * or users.json, and orders from the first version's rows or trigger-orders.json.
    */
   async importLegacy(dir = STATE_DIR): Promise<void> {
-    const { rows: w } = await this.#query('select count(*)::int as n from paperwatch.wallets')
+    const { rows: w } = await this.#query(`select count(*)::int as n from ${S}.wallets`)
     if (!w[0].n) {
       let legacy: UserRecord[] = []
-      const { rows: t } = await this.#query(`select to_regclass('paperwatch.users') is not null as has`)
-      if (t[0].has) legacy = (await this.#query('select data from paperwatch.users')).rows.map((r) => r.data)
+      const { rows: t } = await this.#query(`select to_regclass('${S}.users') is not null as has`)
+      if (t[0].has) legacy = (await this.#query(`select data from ${S}.users`)).rows.map((r) => r.data)
       if (!legacy.length && existsSync(join(dir, 'users.json'))) legacy = Object.values(JSON.parse(readFileSync(join(dir, 'users.json'), 'utf8')))
       for (const u of legacy) {
         await this.#query(
-          `insert into paperwatch.wallets (wallet, created_at, next_nonce, key_address, key_sealed, key_expiry, key_submitted_at, key_registered_at,
+          `insert into ${S}.wallets (wallet, created_at, next_nonce, key_address, key_sealed, key_expiry, key_submitted_at, key_registered_at,
              pending_key, fee_tx, fee_paid_at, fee_wei)
            values ($1, to_timestamp($2 / 1000.0), $3, $4, $5, $6, to_timestamp($7 / 1000.0), to_timestamp($8 / 1000.0), $9, $10, to_timestamp($11 / 1000.0), $12)
            on conflict do nothing`,
@@ -224,10 +230,10 @@ export class Store {
       if (legacy.length) log('db', `imported ${legacy.length} wallet(s)`)
     }
     // The first version's orders table has the same shape, so its rows are already in place; only a file needs copying.
-    const { rows: o } = await this.#query('select count(*)::int as n from paperwatch.orders')
+    const { rows: o } = await this.#query(`select count(*)::int as n from ${S}.orders`)
     if (!o[0].n && existsSync(join(dir, 'trigger-orders.json'))) {
       const orders = JSON.parse(readFileSync(join(dir, 'trigger-orders.json'), 'utf8')) as TriggerOrder[]
-      for (const order of orders) await this.#query('insert into paperwatch.orders (id, data) values ($1, $2) on conflict do nothing', [order.id, JSON.stringify(order)])
+      for (const order of orders) await this.#query(`insert into ${S}.orders (id, data) values ($1, $2) on conflict do nothing`, [order.id, JSON.stringify(order)])
       if (orders.length) log('db', `imported ${orders.length} order(s)`)
     }
   }
@@ -236,9 +242,9 @@ export class Store {
   async refresh(): Promise<void> {
     const since = (d: Date) => new Date(d.getTime() - REFRESH_OVERLAP_MS)
     const [w, o, c] = await Promise.all([
-      this.#query('select *, now() as seen from paperwatch.wallets where updated_at > $1', [since(this.#cursor.wallets)]),
-      this.#query('select data, now() as seen from paperwatch.orders where updated_at > $1', [since(this.#cursor.orders)]),
-      this.#query('select *, now() as seen from paperwatch.closes where updated_at > $1', [since(this.#cursor.closes)]),
+      this.#query(`select *, now() as seen from ${S}.wallets where updated_at > $1`, [since(this.#cursor.wallets)]),
+      this.#query(`select data, now() as seen from ${S}.orders where updated_at > $1`, [since(this.#cursor.orders)]),
+      this.#query(`select *, now() as seen from ${S}.closes where updated_at > $1`, [since(this.#cursor.closes)]),
     ])
     for (const r of w.rows) this.#putUser(r)
     for (const r of o.rows) this.#putOrder(r.data)
@@ -253,9 +259,9 @@ export class Store {
   /** Delete finished orders past the newest KEEP_DONE per wallet (every replica drops the same ones on its own). */
   async pruneOrders(): Promise<void> {
     await this.#query(
-      `delete from paperwatch.orders where id in (
+      `delete from ${S}.orders where id in (
          select id from (select id, row_number() over (partition by wallet order by (data->>'createdAt')::bigint desc) as n
-                         from paperwatch.orders where status not in ('armed', 'sending', 'sent')) ranked
+                         from ${S}.orders where status not in ('armed', 'sending', 'sent')) ranked
          where n > $1)`,
       [KEEP_DONE],
     )
@@ -286,13 +292,13 @@ export class Store {
 
   async ensureUser(wallet: Address): Promise<UserRecord> {
     const id = wallet.toLowerCase()
-    await this.#query('insert into paperwatch.wallets (wallet, next_nonce) values ($1, $2) on conflict do nothing', [id, String(randomNonceStart())])
-    const { rows } = await this.#query('select * from paperwatch.wallets where wallet = $1', [id])
+    await this.#query(`insert into ${S}.wallets (wallet, next_nonce) values ($1, $2) on conflict do nothing`, [id, String(randomNonceStart())])
+    const { rows } = await this.#query(`select * from ${S}.wallets where wallet = $1`, [id])
     return this.#putUser(rows[0])
   }
 
   async #updateUser(wallet: string, set: string, params: unknown[], where = ''): Promise<UserRecord | null> {
-    const { rows } = await this.#query(`update paperwatch.wallets set ${set} where wallet = $1 ${where} returning *`, [wallet.toLowerCase(), ...params])
+    const { rows } = await this.#query(`update ${S}.wallets set ${set} where wallet = $1 ${where} returning *`, [wallet.toLowerCase(), ...params])
     return rows[0] ? this.#putUser(rows[0]) : null
   }
 
@@ -345,7 +351,7 @@ export class Store {
 
   /** The wallet's next intent nonce, from an atomic counter: two sends can never get the same one. */
   async takeNonce(wallet: Address): Promise<bigint> {
-    const { rows } = await this.#query('update paperwatch.wallets set next_nonce = next_nonce + 1 where wallet = $1 returning *', [wallet.toLowerCase()])
+    const { rows } = await this.#query(`update ${S}.wallets set next_nonce = next_nonce + 1 where wallet = $1 returning *`, [wallet.toLowerCase()])
     if (!rows[0]) throw new Error('unknown wallet')
     this.#putUser(rows[0])
     return BigInt(rows[0].next_nonce) - 1n
@@ -359,7 +365,7 @@ export class Store {
   // ---- orders -----------------------------------------------------------------------------------------------------
 
   async addOrder(o: TriggerOrder): Promise<TriggerOrder> {
-    const { rows } = await this.#query('insert into paperwatch.orders (id, data) values ($1, $2) returning data', [o.id, JSON.stringify(o)])
+    const { rows } = await this.#query(`insert into ${S}.orders (id, data) values ($1, $2) returning data`, [o.id, JSON.stringify(o)])
     return this.#putOrder(rows[0].data)
   }
 
@@ -370,7 +376,7 @@ export class Store {
   async transition(id: string, from: OrderStatus[], patch: Partial<TriggerOrder>): Promise<TriggerOrder | null> {
     const drop = Object.keys(patch).filter((k) => patch[k as keyof TriggerOrder] === undefined)
     const { rows } = await this.#query(
-      `update paperwatch.orders set data = (data || $2::jsonb) - $4::text[] where id = $1 and data->>'status' = any($3::text[]) returning data`,
+      `update ${S}.orders set data = (data || $2::jsonb) - $4::text[] where id = $1 and data->>'status' = any($3::text[]) returning data`,
       [id, JSON.stringify(patch), from, drop],
     )
     return rows[0] ? this.#putOrder(rows[0].data) : null
@@ -380,17 +386,17 @@ export class Store {
 
   async putSignIn(wallet: Address, message: string): Promise<void> {
     await this.#query(
-      `insert into paperwatch.sign_ins (wallet, message) values ($1, $2)
+      `insert into ${S}.sign_ins (wallet, message) values ($1, $2)
        on conflict (wallet) do update set message = excluded.message, created_at = now()`,
       [wallet.toLowerCase(), message],
     )
-    if (Math.random() < 0.01) await this.#query(`delete from paperwatch.sign_ins where created_at < now() - interval '1 hour'`)
+    if (Math.random() < 0.01) await this.#query(`delete from ${S}.sign_ins where created_at < now() - interval '1 hour'`)
   }
 
   /** The wallet's pending sign-in message, used up by this call; null if none or older than `ttlMs`. */
   async takeSignIn(wallet: Address, ttlMs: number): Promise<string | null> {
     const { rows } = await this.#query(
-      `delete from paperwatch.sign_ins where wallet = $1 and created_at > now() - make_interval(secs => $2) returning message`,
+      `delete from ${S}.sign_ins where wallet = $1 and created_at > now() - make_interval(secs => $2) returning message`,
       [wallet.toLowerCase(), ttlMs / 1000],
     )
     return rows[0]?.message ?? null
@@ -401,9 +407,9 @@ export class Store {
   /** Queue a close for the worker; false while another close for this position is on its way. */
   async claimClose(positionId: string, wallet: Address): Promise<boolean> {
     const { rows } = await this.#query(
-      `insert into paperwatch.closes (position_id, wallet) values ($1, $2)
+      `insert into ${S}.closes (position_id, wallet) values ($1, $2)
        on conflict (position_id) do update set wallet = excluded.wallet, intent_id = null, done = false, status = 'requested', error = null, created_at = now()
-         where paperwatch.closes.done or paperwatch.closes.created_at < now() - make_interval(secs => $3)
+         where ${S}.closes.done or ${S}.closes.created_at < now() - make_interval(secs => $3)
        returning *`,
       [positionId, wallet.toLowerCase(), CLOSE_STALE_MS / 1000],
     )
@@ -413,13 +419,13 @@ export class Store {
 
   /** The worker takes a requested close to send it; null if it was already taken. */
   async takeClose(positionId: string): Promise<Close | null> {
-    const { rows } = await this.#query(`update paperwatch.closes set status = 'sending' where position_id = $1 and status = 'requested' and not done returning *`, [positionId])
+    const { rows } = await this.#query(`update ${S}.closes set status = 'sending' where position_id = $1 and status = 'requested' and not done returning *`, [positionId])
     return rows[0] ? this.#putClose(rows[0]) : null
   }
 
   async setClose(positionId: string, patch: { intentId?: Hex; done?: boolean; status?: CloseStatus; error?: string }): Promise<void> {
     const { rows } = await this.#query(
-      `update paperwatch.closes set intent_id = coalesce($2, intent_id), done = coalesce($3, done), status = coalesce($4, status), error = coalesce($5, error)
+      `update ${S}.closes set intent_id = coalesce($2, intent_id), done = coalesce($3, done), status = coalesce($4, status), error = coalesce($5, error)
        where position_id = $1 returning *`,
       [positionId, patch.intentId ?? null, patch.done ?? null, patch.status ?? null, patch.error ?? null],
     )
@@ -453,14 +459,14 @@ export class Store {
 
   async put(id: string, data: unknown): Promise<void> {
     await this.#query(
-      'insert into paperwatch.kv (id, data) values ($1, $2) on conflict (id) do update set data = excluded.data, updated_at = now()',
+      `insert into ${S}.kv (id, data) values ($1, $2) on conflict (id) do update set data = excluded.data, updated_at = now()`,
       [id, JSON.stringify(data)],
     )
   }
 
   /** Every kv row whose id starts with `prefix`. */
   async getPrefix<T>(prefix: string): Promise<{ id: string; data: T }[]> {
-    const { rows } = await this.#query('select id, data from paperwatch.kv where id like $1', [prefix.replace(/[%_]/g, '\\$&') + '%'])
+    const { rows } = await this.#query(`select id, data from ${S}.kv where id like $1`, [prefix.replace(/[%_]/g, '\\$&') + '%'])
     return rows.map((r) => ({ id: String(r.id), data: r.data as T }))
   }
 
@@ -470,14 +476,14 @@ export class Store {
   }
 
   async get<T>(id: string): Promise<T | null> {
-    const { rows } = await this.#query('select data from paperwatch.kv where id = $1', [id])
+    const { rows } = await this.#query(`select data from ${S}.kv where id = $1`, [id])
     return (rows[0]?.data as T) ?? null
   }
 
   /** Append one user action to the activity log (in the background, in order; a failure is logged, not thrown). */
   event(type: string, wallet: string | null, data: Record<string, unknown> = {}): void {
     this.#events = this.#events
-      .then(() => this.#query('insert into paperwatch.events (type, wallet, data) values ($1, $2, $3)', [type, wallet?.toLowerCase() ?? null, JSON.stringify(data)]))
+      .then(() => this.#query(`insert into ${S}.events (type, wallet, data) values ($1, $2, $3)`, [type, wallet?.toLowerCase() ?? null, JSON.stringify(data)]))
       .then(
         () => {},
         (err: Error) => log('warn', `activity log: ${err.message}`),

@@ -341,7 +341,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     a.usedAt = Date.now()
     return a
   }
-  if (worker) for (const o of allOrders()) if (o.status === 'armed' || o.status === 'sent') account(o.wallet)
+  // Dry runs never open account feeds (they size from PT_TRIGGER_DRY_BALANCE), so a load test can't hammer Papertrade.
+  if (worker && opts.live) for (const o of allOrders()) if (o.status === 'armed' || o.status === 'sent') account(o.wallet)
   setInterval(() => {
     for (const [id, a] of accounts) {
       const busy =
@@ -428,7 +429,6 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       .catch(() => null)
 
   const fire = async (o: TriggerOrder, inst: Instrument, mid: { raw: bigint; px: number }) => {
-    const a = account(o.wallet)
     const user = users.get(o.wallet)
     const size = sizeOrder(o, freeUsd(o.wallet) - inFlightUsd(o.wallet), inst, trading)
     if (typeof size === 'string' || !user?.key) return
@@ -442,6 +442,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     const claimed = await settle(o, ['armed'], { status: 'sending', attempts: o.attempts + 1, firedPx: mid.px, marginUsd: size.marginUsd, sentAt: Date.now(), note: undefined },
       `FIRE at ${mid.px}: ${usd(size.notionalUsd, 0)} (${usd(size.marginUsd)} margin), queue ${pub.pressure?.queuedIntents ?? '?'}`)
     if (!claimed) return
+    const a = account(o.wallet)
     let signed: Awaited<ReturnType<typeof signIntent>>
     try {
       signed = await signIntent(privateKeyToAccount(keys.open(user.key.sealed)), EXCHANGE_DOMAIN, 'OpenPosition', {
@@ -926,7 +927,6 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         const ok = await verifyMessage({ address: body.wallet, message, signature: body.signature as Hex }).catch(() => false)
         if (!ok) return json(res, 401, { error: 'That signature is not from this wallet.' })
         const user = await store.ensureUser(body.wallet)
-        account(user.wallet)
         track('sign_in', user.wallet)
         log('login', short(user.wallet))
         return json(res, 200, { wallet: user.wallet }, { 'set-cookie': sessionCookie(issueToken(user.wallet, authSecret, AUTH_TTL_MS), AUTH_TTL_MS / 1000) })
