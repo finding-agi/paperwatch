@@ -881,6 +881,9 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     // Every write needs our header: browsers won't send it cross-site without a preflight we never allow (CSRF).
     if (req.method !== 'GET' && req.headers['x-paperwatch'] !== '1') return json(res, 403, { error: 'missing request header' })
     const wallet = readToken(cookieOf(req), authSecret)
+    // A signed-in action reads this wallet's row fresh: its last change may have gone through another replica, which
+    // this replica's copy only picks up on the next refresh (up to a second later).
+    if (wallet && req.method === 'POST') await store.ensureUser(wallet)
     const needWallet = () => {
       if (!wallet) json(res, 401, { error: 'Connect and sign in with your wallet first.' })
       return wallet
@@ -985,7 +988,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (req.method === 'POST' && url.pathname === '/api/trading/register') {
         if (!needWallet() || locked()) return
         const body = await readBody(req)
-        const user = users.get(wallet!)
+        const user = await store.ensureUser(wallet!) // fresh from the database: the last write may have gone through another replica
         const pending = user?.pendingKey
         if (!user || !pending) return json(res, 400, { error: 'Start again: no trading key is waiting for approval.' })
         const p = pending.input
@@ -1023,7 +1026,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       // Turn trading off: forget the key here, and hand back the transaction that revokes it on Papertrade.
       if (req.method === 'POST' && url.pathname === '/api/trading/revoke') {
         if (!needWallet()) return
-        const user = users.get(wallet!)
+        const user = await store.ensureUser(wallet!) // fresh from the database: the last write may have gone through another replica
         if (!user?.key) return json(res, 400, { error: 'Trading is not enabled.' })
         const keyAddress = user.key.address
         await store.clearKey(user.wallet)
@@ -1036,7 +1039,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (req.method === 'POST' && url.pathname === '/api/orders') {
         if (!needWallet() || locked()) return
         // The worker re-checks the key on-chain before sending, and holds the order if it isn't active.
-        if (!users.get(wallet!)?.key) return json(res, 400, { error: 'Enable trading first.' })
+        if (!(await store.ensureUser(wallet!)).key) return json(res, 400, { error: 'Enable trading first.' })
         if (allOrders().filter((o) => o.wallet === wallet && o.status === 'armed').length >= MAX_ARMED_PER_WALLET) {
           return json(res, 400, { error: `You can have up to ${MAX_ARMED_PER_WALLET} open limit intents.` })
         }
@@ -1055,7 +1058,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       const close = url.pathname.match(/^\/api\/positions\/(\d+)\/close$/)
       if (req.method === 'POST' && close) {
         if (!needWallet()) return
-        const user = users.get(wallet!)
+        const user = await store.ensureUser(wallet!) // fresh from the database: the last write may have gone through another replica
         if (!user?.key) return json(res, 400, { error: 'Enable trading first.' })
         const id = close[1]
         // The worker checks the position is this wallet's and the key is active before it sends anything.
