@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
-import { getTradingState } from './api.ts'
+import { getTradingState, type Instrument, type TradingState } from './api.ts'
 import { readMids } from './market.ts'
 import { sideHeadroomUsd } from './risk.ts'
 import { baseHeaders, serveAsset, servePage, serveSiteJs } from './site.ts'
@@ -108,7 +108,12 @@ function condense(s: Record<string, any>) {
  * stream and the page. `npm run queue` serves them on their own; on paperwatch.app the Limit Intents server mounts
  * them at /queue.
  */
-export function startQueueRelay() {
+export function startQueueRelay(live?: {
+  /** The host's own market state and streamed mids: on paperwatch.app the OI poll reuses them instead of calling
+   *  Papertrade and Hyperliquid's REST API itself (each replica polling allMids drew HTTP 429s). */
+  trading: () => TradingState | null
+  midRaw: (inst: Instrument) => bigint | null
+}) {
   const history: string[] = []
   const clients = new Set<ServerResponse>()
   let connected = false
@@ -202,8 +207,16 @@ export function startQueueRelay() {
   // USD a new position can still add on each side before that side's OI cap (null = uncapped).
   const pollOi = async () => {
     try {
-      const trading = await getTradingState()
-      const midsRaw = await readMids(trading.instruments)
+      const trading = live?.trading() ?? (await getTradingState())
+      let midsRaw: Map<number, bigint>
+      if (live) {
+        midsRaw = new Map()
+        for (const inst of trading.instruments) {
+          const mid = live.midRaw(inst)
+          if (mid == null) throw new Error(`no live mid for ${inst.symbol} yet`)
+          midsRaw.set(inst.id, mid)
+        }
+      } else midsRaw = await readMids(trading.instruments)
       const room = (v: number) => (Number.isFinite(v) ? Math.round(v) : null)
       send('oi', {
         t: Date.now(),

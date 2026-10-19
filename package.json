@@ -36,6 +36,7 @@
     "@electric-sql/pglite": "0.3.16",
     "@types/node": "24.19.0",
     "@types/pg": "8.23.1",
+    "railway": "^3.16.0",
     "typescript": "5.9.3"
   }
 }

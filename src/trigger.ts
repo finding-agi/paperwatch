@@ -802,7 +802,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
 
   const candles = new CandleStore()
   // paperwatch.app is this one server: Trade at /trade (also /limits), the queue page at /queue (also /que), shared top bar.
-  const queue = startQueueRelay()
+  const queue = startQueueRelay({ trading: () => (Date.now() - tradingAt < TRADING_STALE_MS ? trading : null), midRaw: (inst) => midPx(inst)?.raw ?? null })
   createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://x')
     baseHeaders(res)
