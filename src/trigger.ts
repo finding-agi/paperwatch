@@ -17,7 +17,9 @@ import { Store } from './db.ts'
 import { NONCE_ABI } from './state.ts'
 import { Keyring } from './keyring.ts'
 import { issueToken, readToken, signInMessage, type UserRecord } from './users.ts'
-import { log, makeClient, usd } from './bot.ts'
+import { log, makeClient, usd, warnTimes } from './bot.ts'
+import { Alerter } from './alerts.ts'
+import { alertLeader, percentile, summarize, type Summary, type WebBeat, type WorkerBeat } from './status.ts'
 
 // Limit Intents (its own Railway service, PT_PROCESS=trigger), a public page where anyone can place orders like "long
 // BTC once it trades at or below $79,000, $225 margin at 35x" on their own Papertrade account:
@@ -260,11 +262,13 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   const client = makeClient()
   let refreshing = false
   let refreshWarned = 0
+  let refreshedAt = Date.now()
   setInterval(() => {
     if (refreshing) return
     refreshing = true
     store
       .refresh()
+      .then(() => (refreshedAt = Date.now()))
       .catch((err) => {
         if (Date.now() - refreshWarned < 60_000) return
         refreshWarned = Date.now()
@@ -480,8 +484,10 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   // One check a second: expire old orders, then send up to SENDS_PER_PASS triggered orders, one per wallet.
   let busy = false
   const firing = new Set<string>() // orders this process is sending, so the next pass doesn't try to claim them again
+  let lastCheckAt = 0
   const check = async () => {
     if (busy || !modeOk) return
+    lastCheckAt = Date.now()
     busy = true
     try {
       for (const o of allOrders()) {
@@ -630,6 +636,56 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     setInterval(() => void sendCloses().catch((err) => log('warn', `closes: ${errMsg(err)}`)), CHECK_MS)
     setInterval(() => void store.pruneOrders().catch((err) => log('warn', `prune orders: ${errMsg(err)}`)), PRUNE_MS)
     if (FEE_ADDRESS) void scanFees()
+    // Heartbeat for the status page: what the worker is doing, and how orders went over the last hour.
+    const beat = async () => {
+      const now = Date.now()
+      const hour = allOrders().filter((o) => o.sentAt && now - o.sentAt < 3_600_000)
+      const waits = hour.flatMap((o) => (o.status === 'filled' && o.fill && o.fill.positionId !== 'dry' ? [o.fill.waitedS] : []))
+      const ages = trading.instruments.filter((i) => !i.retired).map((i) => now - (bbo.get(i.symbol)?.at ?? 0))
+      const w: WorkerBeat = {
+        at: now,
+        mode,
+        lastCheckAt,
+        feeds: accounts.size,
+        sends1h: hour.length,
+        fails1h: hour.filter((o) => o.status === 'failed').length,
+        unconfirmed1h: hour.filter((o) => o.status === 'unconfirmed').length,
+        fillP50s: percentile(waits, 0.5),
+        fillP95s: percentile(waits, 0.95),
+        priceAgeMs: ages.length ? Math.max(...ages) : null,
+        warns10m: warnTimes.filter((t) => now - t < 600_000).length,
+      }
+      await store.put('status:worker', w)
+    }
+    setInterval(() => void beat().catch((err) => log('warn', `status beat: ${errMsg(err)}`)), 10_000)
+  }
+
+  // ---- status: /api/status, the /status page, and alerts from one web replica -------------------------------------------
+  const replica = process.env.RAILWAY_REPLICA_ID?.slice(0, 8) ?? 'local'
+  let statusCache: { at: number; summary: Summary } | null = null
+  const currentStatus = async (): Promise<Summary> => {
+    if (statusCache && Date.now() - statusCache.at < 5000) return statusCache.summary
+    const [rows, dbOk] = await Promise.all([store.getPrefix<WorkerBeat | WebBeat>('status:').catch(() => []), store.ping()])
+    const worker = (rows.find((r) => r.id === 'status:worker')?.data as WorkerBeat | undefined) ?? null
+    const webs = rows.filter((r) => r.id.startsWith('status:web:')).map((r) => r.data as WebBeat)
+    const summary = summarize(Date.now(), worker, webs, dbOk, pub.pressure?.queuedIntents ?? null, MAX_QUEUED)
+    statusCache = { at: Date.now(), summary }
+    return summary
+  }
+  if (web) {
+    const alerter = new Alerter()
+    setInterval(async () => {
+      try {
+        const now = Date.now()
+        const beat: WebBeat = { at: now, replica, lives: lives.size, refreshAgeMs: now - refreshedAt, warns10m: warnTimes.filter((t) => now - t < 600_000).length }
+        await store.put(`status:web:${replica}`, beat)
+        const webs = (await store.getPrefix<WebBeat>('status:web:')).map((r) => r.data)
+        if (alertLeader(now, webs) !== replica) return
+        for (const p of (await currentStatus()).parts) alerter.set(p.name, p.status !== 'ok', p.status === 'down' ? 'crit' : 'warn', `paperwatch.app ${p.name}: ${p.detail}`)
+      } catch (err) {
+        log('warn', `status: ${errMsg(err)}`)
+      }
+    }, 10_000)
   }
 
   // ---- HTTP ------------------------------------------------------------------------------------------------------------
@@ -805,6 +861,11 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (['/queue', '/queue/', '/que', '/que/'].includes(url.pathname)) return queue.page(res)
       if (url.pathname === '/events') return queue.events(req, res)
       if (url.pathname === '/site.js') return serveSiteJs(res, true)
+      if (url.pathname === '/status' || url.pathname === '/status/') return servePage(res, 'status.html')
+      if (url.pathname === '/api/status') {
+        const summary = await currentStatus()
+        return json(res, summary.status === 'down' ? 503 : 200, summary)
+      }
       if (url.pathname === '/account-frames.js') return serveAccountFrames(res)
       if (url.pathname === '/healthz') {
         // Note the first check each process answers, so a deploy's logs show Railway's health check ran.

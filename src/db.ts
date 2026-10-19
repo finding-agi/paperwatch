@@ -458,6 +458,17 @@ export class Store {
     )
   }
 
+  /** Every kv row whose id starts with `prefix`. */
+  async getPrefix<T>(prefix: string): Promise<{ id: string; data: T }[]> {
+    const { rows } = await this.#query('select id, data from paperwatch.kv where id like $1', [prefix.replace(/[%_]/g, '\\$&') + '%'])
+    return rows.map((r) => ({ id: String(r.id), data: r.data as T }))
+  }
+
+  /** A cheap round trip, for the status page. */
+  async ping(): Promise<boolean> {
+    return this.#query('select 1').then(() => true, () => false)
+  }
+
   async get<T>(id: string): Promise<T | null> {
     const { rows } = await this.#query('select data from paperwatch.kv where id = $1', [id])
     return (rows[0]?.data as T) ?? null

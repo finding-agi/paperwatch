@@ -13,7 +13,16 @@ import { adverseMove, attach, decide, isLive, reconcile, type Decision, type Leg
 import { AdminWatcher } from './watch.ts'
 import { writeHeartbeat } from './heartbeat.ts'
 
-export const log = (tag: string, msg: string) => console.log(`${new Date().toISOString()} ${tag.padEnd(6)} ${msg}`)
+/** When recent 'warn' lines were logged (for the status page's error count); trimmed to the last 10 minutes. */
+export const warnTimes: number[] = []
+export const log = (tag: string, msg: string) => {
+  if (tag === 'warn') {
+    const now = Date.now()
+    warnTimes.push(now)
+    while (warnTimes.length && now - warnTimes[0] > 600_000) warnTimes.shift()
+  }
+  console.log(`${new Date().toISOString()} ${tag.padEnd(6)} ${msg}`)
+}
 export const pct = (x: number, digits = 2) => `${(x * 100).toFixed(digits)}%`
 export const usd = (x: number, digits = 2) =>
   `${x < 0 ? '-' : ''}$${Math.abs(x).toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })}`

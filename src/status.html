@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status · Paperwatch</title>
+<link rel="icon" href="/assets/favicon.png">
+<style>
+  :root { --bg: #faf7f2; --surface: #fff; --ink: #211b14; --label: #7a6f62; --border: #e8e1d6; --ok: #1f8a4c; --warn: #b7791f; --down: #c53030; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #15120e; --surface: #1d1914; --ink: #f2ece3; --label: #a59a8c; --border: #332c24; } }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, sans-serif; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .overall { font-size: 17px; font-weight: 600; margin: 16px 0; padding: 14px 16px; border-radius: 4px; color: #fff; }
+  .ok { background: var(--ok); } .degraded { background: var(--warn); } .down { background: var(--down); }
+  .part { display: grid; grid-template-columns: 12px 1fr; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); }
+  .dot { width: 12px; height: 12px; border-radius: 50%; margin-top: 5px; }
+  .name { font-weight: 600; }
+  .detail, .fine { color: var(--label); font-size: 14px; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Paperwatch status</h1>
+  <div class="fine"><a href="/trade">paperwatch.app</a> · refreshes every 10 seconds</div>
+  <div class="overall" id="overall">Checking…</div>
+  <div id="parts"></div>
+  <p class="fine" id="updated"></p>
+</div>
+<script>
+const words = { ok: 'All systems working', degraded: 'Some things are slow or holding', down: 'Something is down' }
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
+async function load() {
+  try {
+    const s = await (await fetch('/api/status', { cache: 'no-store' })).json()
+    document.getElementById('overall').className = `overall ${s.status}`
+    document.getElementById('overall').textContent = words[s.status] ?? s.status
+    document.getElementById('parts').innerHTML = s.parts.map((p) =>
+      `<div class="part"><div class="dot ${esc(p.status)}"></div><div><div class="name">${esc(p.name)}</div><div class="detail">${esc(p.detail)}</div></div></div>`).join('')
+    document.getElementById('updated').textContent = `Updated ${new Date(s.updatedAt).toLocaleTimeString()}`
+  } catch {
+    document.getElementById('overall').className = 'overall down'
+    document.getElementById('overall').textContent = 'Could not reach paperwatch.app'
+  }
+}
+load()
+setInterval(load, 10_000)
+</script>
+</body>
+</html>
