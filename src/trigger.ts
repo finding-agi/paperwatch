@@ -497,9 +497,10 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           continue
         }
         let hold: string | null = null
+        // The account feed first: the key's status comes from it, and the worker opens a wallet's feed only here.
         if (Date.now() - tradingAt > TRADING_STALE_MS) hold = 'waiting for fresh market state'
-        else if (tradingStatus(users.get(o.wallet)).status !== 'active') hold = 'trading key not active; enable trading again'
         else if (opts.live && !account(o.wallet).stream.state) hold = 'waiting for the account feed'
+        else if (tradingStatus(users.get(o.wallet)).status !== 'active') hold = 'trading key not active; enable trading again'
         // Market orders go out like a normal trade, whatever the relayer queue; limits hold while it's backed up.
         else hold = holdReason(o, inst, trading, mid.raw, freeUsd(o.wallet) - inFlightUsd(o.wallet), o.kind === 'market' ? null : pub.pressure?.queuedIntents ?? null)
         if (hold) {
