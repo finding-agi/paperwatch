@@ -102,6 +102,9 @@ alter table paperwatch.events enable row level security;
 const KEEP_DONE = 50 // finished orders kept per wallet
 const REFRESH_OVERLAP_MS = 5000 // re-read rows changed this long before the last look, for writes still committing
 const CLOSE_STALE_MS = 10 * 60_000 // a close claim this old no longer blocks another close
+// Connections per process. Supabase's free session pooler takes ~15 clients in all: 2 web replicas + the worker
+// (its pool plus the lock's own connection) stay near 10.
+const POOL_MAX = Number(process.env.PT_DB_POOL_MAX ?? 3)
 const WORKER_LOCK = 7_277_001 // advisory lock id: only the process holding it sends orders and closes
 
 export type CloseStatus = 'requested' | 'sending' | 'sent' | 'failed'
@@ -168,7 +171,7 @@ export class Store {
     if (url) {
       // TLS always. With PT_DATABASE_CA (the project's CA certificate, PEM) the server's certificate is checked too.
       const ca = process.env.PT_DATABASE_CA
-      const pool = new pg.Pool({ connectionString: url.replace(/[?&]sslmode=[^&]*/, ''), ssl: ca ? { ca } : { rejectUnauthorized: false }, max: 5 })
+      const pool = new pg.Pool({ connectionString: url.replace(/[?&]sslmode=[^&]*/, ''), ssl: ca ? { ca } : { rejectUnauthorized: false }, max: POOL_MAX })
       pool.on('error', (err) => log('warn', `database: ${err.message}`))
       const session = async (): Promise<Query> => {
         const client = await pool.connect() // never released: a session-level lock lives as long as this connection
