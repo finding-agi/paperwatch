@@ -655,19 +655,55 @@ function enrich() {
     : frames.keyStatus(state.key, undefined, true)
 }
 
+// ---- live updates: one stream per page (/api/live), and a 5-second poll only while it can't connect -------------
+// The stream sends the shared part (prices, open-interest room, queue) every second and this page's own part (sign-in,
+// key, fee, orders, closes) when it changes. It is opened for the signed-in and viewed wallet, so it reopens when either
+// changes. If nothing arrives for 20 s the page polls /api/state every 5 s and tries the stream again each minute.
+let live = null, liveAt = 0, liveMe = null, fallbackSince = 0, drawPending = false
+function connectLive() {
+  live?.close()
+  liveMe = null
+  const viewing = window.paperwatchWallet?.account
+  const es = new EventSource('/api/live' + (viewing ? `?wallet=${viewing}` : ''))
+  const got = {}
+  const take = (part) => (e) => {
+    if (live !== es) return
+    liveAt = Date.now()
+    got[part] = JSON.parse(e.data)
+    if (part === 'me') liveMe = got.me
+    if (got.markets && got.me) showState({ ...got.markets, ...got.me })
+  }
+  es.addEventListener('markets', take('markets'))
+  es.addEventListener('me', take('me'))
+  live = es
+}
+setInterval(() => {
+  if (Date.now() - liveAt < 20_000) { fallbackSince = 0; return }
+  if (!fallbackSince) { fallbackSince = Date.now(); poll() }
+  else if (Date.now() - fallbackSince > 60_000) { fallbackSince = Date.now(); connectLive() }
+}, 5000)
+
+async function showState(s) {
+  state = s
+  // Signed in as a different wallet than the one connected now (or disconnected): drop that session.
+  const browser = window.paperwatchWallet?.account
+  if (state.wallet && browser !== undefined && browser !== state.wallet && walletReady) { await api('/api/auth/logout', {}); connectLive(); return poll() }
+  enrich()
+  if (drawPending) return
+  drawPending = true
+  requestAnimationFrame(() => { drawPending = false; render(); renderUnlock() })
+}
+
+// One fresh read now (after an action, or while the stream is down). Reopens the stream if the signed-in or viewed
+// wallet is no longer the one it was opened for.
 async function poll() {
   clearTimeout(poll.t)
   try {
     const viewing = window.paperwatchWallet?.account
-    state = await api('/api/state' + (viewing ? `?wallet=${viewing}` : ''))
-    // Signed in as a different wallet than the one connected now (or disconnected): drop that session.
-    const browser = window.paperwatchWallet?.account
-    if (state.wallet && browser !== undefined && browser !== state.wallet && walletReady) { await api('/api/auth/logout', {}); state = await api('/api/state' + (viewing ? `?wallet=${viewing}` : '')) }
-    enrich()
-    render()
-    renderUnlock()
+    await showState(await api('/api/state' + (viewing ? `?wallet=${viewing}` : '')))
+    if (liveMe && (liveMe.wallet !== state.wallet || liveMe.view !== state.view)) connectLive()
   } catch {}
-  poll.t = setTimeout(poll, 1000)
+  if (fallbackSince) poll.t = setTimeout(poll, 5000)
 }
 
 // ---- inputs -----------------------------------------------------------------------------------------------------------
@@ -724,7 +760,7 @@ function stage() {
   if (state.trading?.status !== 'active') return 'enable'
   return 'ready'
 }
-window.addEventListener('paperwatch:wallet', () => { walletReady = true; poll() })
+window.addEventListener('paperwatch:wallet', () => { walletReady = true; connectLive(); poll() })
 const walletError = (err) => err?.code === 4001 ? 'Cancelled in your wallet.' : (err?.message || String(err))
 
 async function signIn() {
@@ -822,7 +858,8 @@ $('place').onclick = async () => {
 }
 
 hlConnect()
-api('/api/state').then((s) => { state = s; $('lev-in').value = s.defaultLeverage; $('lev').value = s.defaultLeverage; enrich(); render(); poll.t = setTimeout(poll, 1000) }).catch(() => {})
+api('/api/state').then((s) => { $('lev-in').value = s.defaultLeverage; $('lev').value = s.defaultLeverage; showState(s) }).catch(() => {})
+connectLive()
 </script>
 </body>
 </html>

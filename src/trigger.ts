@@ -704,16 +704,9 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
 
   // `wallet` is who is signed in (can trade); `view` is whose account the box shows, which can be any connected wallet:
   // the account data is public on Papertrade, so it shows on connect, before signing in.
-  const snapshot = (wallet: Address | null, view: Address | null) => ({
+  // What every page shares: prices, open-interest room, the relayer queue and market limits. Built once per tick.
+  const shared = () => ({
     mode,
-    wallet,
-    view,
-    // The page follows the account on Papertrade itself (balances, positions, whether the key is on-chain), so the server
-    // sends only what lives here: the stored key, closes on their way, orders and margin in flight.
-    key: wallet && users.get(wallet)?.key ? (({ sealed: _, ...k }) => k)(users.get(wallet)!.key!) : null,
-    fee: feeInfo(wallet),
-    inFlightUsd: view ? inFlightUsd(view) : 0,
-    closes: view ? closesFor(view) : [],
     stakingContract: CONTRACTS.paperStaking,
     dryBalanceUsd: opts.live ? null : dryBalance,
     queued: pub.pressure?.queuedIntents ?? null,
@@ -739,8 +732,58 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       }),
     minMarginUsd: Number(trading.minimumTradeSizeRaw) / 1e18,
     minNotionalUsd: Number(trading.minimumOpenNotionalRaw) / 1e18,
-    orders: wallet ? allOrders().filter((o) => o.wallet === wallet).sort((a, b) => b.createdAt - a.createdAt) : [],
   })
+
+  // What is one visitor's own: who is signed in, the stored key, the unlock fee, their orders and closes. The page follows
+  // the account on Papertrade itself (balances, positions, whether the key is on-chain), so none of that is here.
+  // `byWallet` (orders and closes grouped by wallet) lets the live stream build this for every page without a scan each.
+  const groupByWallet = () => {
+    const orders = new Map<string, TriggerOrder[]>()
+    for (const o of store.orders.values()) orders.set(o.wallet, [...(orders.get(o.wallet) ?? []), o])
+    return orders
+  }
+  const mine = (wallet: Address | null, view: Address | null, ordersOf = groupByWallet()) => {
+    const own = (w: Address | null) => (w ? (ordersOf.get(w) ?? []) : [])
+    return {
+      wallet,
+      view,
+      key: wallet && users.get(wallet)?.key ? (({ sealed: _, ...k }) => k)(users.get(wallet)!.key!) : null,
+      fee: feeInfo(wallet),
+      // Margin already committed by this wallet's sent-but-unfilled orders, so two orders can't both spend it.
+      inFlightUsd: own(view).filter((o) => o.status === 'sending' || o.status === 'sent').reduce((sum, o) => sum + (o.marginUsd ?? 0), 0),
+      closes: view ? closesFor(view) : [],
+      orders: own(wallet).sort((a, b) => b.createdAt - a.createdAt),
+    }
+  }
+  const snapshot = (wallet: Address | null, view: Address | null) => ({ ...shared(), ...mine(wallet, view) })
+
+  // ---- live updates: one server-sent-events stream per page (/api/live) -----------------------------------------------
+  // Every second each replica builds the shared part once and sends the same text to every page; each page's own part
+  // goes out only when it changed. A comment every 15 s keeps idle connections open through Cloudflare (100 s limit).
+  type Live = { res: ServerResponse; wallet: Address | null; view: Address | null; lastMine: string }
+  const lives = new Set<Live>()
+  const sse = (event: string, data: string) => `event: ${event}\ndata: ${data}\n\n`
+  const liveTick = () => {
+    if (!lives.size) return
+    const sharedMsg = sse('markets', JSON.stringify(shared()))
+    const ordersOf = groupByWallet()
+    for (const l of lives) {
+      // A page that stops reading (asleep, bad network) is dropped rather than buffered for; it reconnects on its own.
+      if (l.res.writableLength > 1_000_000) {
+        l.res.destroy()
+        lives.delete(l)
+        continue
+      }
+      const me = JSON.stringify(mine(l.wallet, l.view, ordersOf))
+      l.res.write(me === l.lastMine ? sharedMsg : sharedMsg + sse('me', me))
+      l.lastMine = me
+      if (l.wallet && !feeOk(l.wallet)) markFeeWaiting()
+    }
+  }
+  setInterval(liveTick, 1000)
+  setInterval(() => {
+    for (const l of lives) l.res.write(': keep-alive\n\n')
+  }, 15_000)
 
   const candles = new CandleStore()
   // paperwatch.app is this one server: Trade at /trade (also /limits), the queue page at /queue (also /que), shared top bar.
@@ -776,6 +819,17 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       return wallet
     }
     try {
+      if (req.method === 'GET' && url.pathname === '/api/live') {
+        const asked = url.searchParams.get('wallet')
+        const view: Address | null = wallet ?? (isAddress(asked) ? (asked.toLowerCase() as Address) : null)
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' })
+        const me = JSON.stringify(mine(wallet, view))
+        const l: Live = { res, wallet, view, lastMine: me }
+        res.write('retry: 3000\n\n' + sse('markets', JSON.stringify(shared())) + sse('me', me))
+        lives.add(l)
+        req.on('close', () => lives.delete(l))
+        return
+      }
       if (req.method === 'GET' && url.pathname === '/api/state') {
         if (wallet && !feeOk(wallet)) markFeeWaiting()
         const asked = url.searchParams.get('wallet')
