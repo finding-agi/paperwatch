@@ -247,9 +247,10 @@ export async function runQueueView(): Promise<void> {
   const relay = startQueueRelay()
   createServer((req, res) => {
     baseHeaders(res)
-    if (req.url === '/events') return relay.events(req, res)
-    if (req.url === '/site.js') return serveSiteJs(res)
-    if (req.url?.startsWith('/assets/') && serveAsset(res, req.url.slice(8))) return
+    const path = new URL(req.url ?? '/', 'http://x').pathname // links carry ?v= version stamps
+    if (path === '/events') return relay.events(req, res)
+    if (path === '/site.js') return serveSiteJs(res)
+    if (path.startsWith('/assets/') && serveAsset(res, path.slice(8))) return
     relay.page(res)
   }).listen(PORT, HOST, () => console.log(`${ts()} queue view listening on ${HOST}:${PORT}`))
 

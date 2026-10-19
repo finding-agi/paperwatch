@@ -49,3 +49,15 @@ test('a wallet signature over the RegisterSessionKey typed data turns into a rel
   assert.equal(signed.key, '0x1111111111111111111111111111111111111111')
   assert.equal(signed.expiry, '1800000000')
 })
+
+test('links to our own files get a content stamp; anything else is left alone', async () => {
+  const { versioned } = await import('../src/site.ts')
+  const html = '<script src="/site.js"></script><link href="/assets/favicon.png"><img src="/assets/nope.png"><a href="/trade">'
+  const out = versioned(html)
+  assert.match(out, /src="\/site\.js\?v=[0-9a-f]{10}"/)
+  assert.match(out, /href="\/assets\/favicon\.png\?v=[0-9a-f]{10}"/)
+  assert.ok(out.includes('src="/assets/nope.png"')) // unknown file: untouched
+  assert.ok(out.includes('href="/trade"'))
+  assert.equal(versioned(html), out) // stable while the files don't change
+  assert.match(versioned("src: url('/assets/manrope.woff2')"), /manrope\.woff2\?v=[0-9a-f]{10}'\)/)
+})
