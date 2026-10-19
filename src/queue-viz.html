@@ -7,23 +7,25 @@
 <link rel="icon" type="image/png" href="/assets/favicon.png">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <style>
-  /* Paperwatch brand: brown page, light-brown widgets, orange accent. Text on the widgets is dark brown for contrast. */
+  /* Paperwatch: brand brown page and orange accent, with Papertrade's tan widgets and green/red inside them. */
   :root {
     color-scheme: light;
     --page: #50413d;
-    --surface: #e1c3bb;
-    --raised: #ead3cc;
-    --ink: #2b201c;
-    --ink-2: #3b2e2a;
-    --label: #6b524b;
-    --axis: #7a6058;
-    --grid: #d6b5ac;
-    --rule: #50413d;
-    --border: #cfaea4;
+    --surface: #f4eedb;
+    --raised: #fbf8f2;
+    --ink: #211b14;
+    --ink-2: #322f27;
+    --label: #736c5e;
+    --axis: #827c69;
+    --grid: #e6dfc9;
+    --rule: #5c574c;
+    --border: #e1d9c2;
     --line: #f04f24;
     --line-text: #b8380f;
-    --green: #2f5a36;
-    --red: #9c2b1b;
+    --green: #395e3d;
+    --red: #8f3328;
+    --up: #395e3d;
+    --down: #8f3328;
   }
 
   * { box-sizing: border-box; }
@@ -65,8 +67,8 @@
   .stat { display: flex; flex-direction: column; gap: 6px; min-width: 0; font-size: 14px; }
   .stat .hint { align-self: flex-start; }
   .stat .roll { color: var(--ink-2); font-size: 20px; }
-  .roll.up { color: var(--red); }
-  .roll.down { color: var(--green); }
+  .roll.up { color: var(--down); }
+  .roll.down { color: var(--up); }
 
   .widget-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 26px; margin-bottom: 10px; }
   .widget h2 { margin: 0; color: var(--ink); font-size: 14px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
@@ -84,20 +86,20 @@
   .ob-row > span { position: relative; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ob-depth { position: absolute; top: 2px; bottom: 2px; right: 0; border-radius: 2px; }
   .ob-r { text-align: right; }
-  .ob-row .ask { color: var(--red); }
-  .ob-row .bid { color: var(--green); }
+  .ob-row .ask { color: var(--down); }
+  .ob-row .bid { color: var(--up); }
   .ob-row .sub { color: var(--label); }
   .ob-mid { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 10px; margin: 4px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
   .ob-mid .roll { color: var(--ink); font-size: 26px; font-weight: 700; }
   .mid-chg { font-size: 14px; margin-left: 10px; }
-  .mid-chg.up { color: var(--green); }
-  .mid-chg.down { color: var(--red); }
+  .mid-chg.up { color: var(--up); }
+  .mid-chg.down { color: var(--down); }
 
   /* OI cap tanks: fill as new positions use the room under the cap, drain when the cap is raised or positions close. */
   .tank-row { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; gap: 14px; align-items: center; height: 36px; font-size: 16px; }
   .tank-row .side { color: var(--label); }
   .tank-row .roll { color: var(--ink-2); font-size: 18px; min-width: 9ch; justify-content: flex-end; }
-  .tank-row .roll.tight { color: var(--red); }
+  .tank-row .roll.tight { color: var(--down); }
   .tank { height: 16px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); overflow: hidden; }
   .tank-fill { height: 100%; width: 0; transition: width 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); }
   .tank-fill.long { background: var(--green); }
@@ -314,7 +316,7 @@ function bookRow(f, side, maxMargin, t) {
   if (!f) return '<div class="ob-row"></div>'
   const age = Math.max(0, (t - f.t) / 1000)
   const fade = age > 30 ? `opacity:${(1 - ((age - 30) / 30) * 0.55).toFixed(2)};` : ''
-  const fresh = age < 1.5 ? `box-shadow:inset 0 0 0 999px rgba(181,96,44,${(0.2 * (1 - age / 1.5)).toFixed(3)});` : '' // new fills flash orange
+  const fresh = age < 1.5 ? `box-shadow:inset 0 0 0 999px rgba(240,79,36,${(0.2 * (1 - age / 1.5)).toFixed(3)});` : '' // new fills flash orange
   const width = Math.max(2, (f.margin / maxMargin) * 100)
   const bar = side === 'ask' ? 'rgba(143,51,40,0.13)' : 'rgba(57,94,61,0.15)'
   return `<div class="ob-row" style="${fade}${fresh}"><div class="ob-depth" style="width:${width.toFixed(1)}%;background:${bar}"></div>` +

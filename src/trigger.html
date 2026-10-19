@@ -8,11 +8,12 @@
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <script src="/vendor/lightweight-charts.js"></script>
 <style>
-  /* Paperwatch brand: brown page, light-brown widgets, orange accent. Text on the widgets is dark brown for contrast. */
+  /* Paperwatch: brand brown page and orange accent, with Papertrade's tan widgets and green/red inside them. */
   :root {
     color-scheme: light;
-    --page: #50413d; --surface: #e1c3bb; --raised: #ead3cc; --ink: #2b201c; --ink-2: #3b2e2a; --label: #6b524b;
-    --grid: #d6b5ac; --border: #cfaea4; --line: #f04f24; --line-text: #b8380f; --green: #2f5a36; --red: #9c2b1b;
+    --page: #50413d; --surface: #f4eedb; --raised: #fbf8f2; --ink: #211b14; --ink-2: #322f27; --label: #736c5e;
+    --grid: #e6dfc9; --border: #e1d9c2; --line: #f04f24; --line-text: #b8380f; --green: #395e3d; --red: #8f3328;
+    --up: #395e3d; --down: #8f3328; --candle-up: #395e3d; --candle-down: #8f3328;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
@@ -22,9 +23,9 @@
   h2 { margin: 0; color: var(--ink); font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
   .muted { color: var(--label); font-size: 13px; }
   .num { font-variant-numeric: tabular-nums; }
-  .up { color: var(--green); }
-  .down { color: var(--red); }
-  .warn { color: var(--red); }
+  .up { color: var(--up); }
+  .down { color: var(--down); }
+  .warn { color: var(--down); }
   .chip { padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #fff; }
   .chip.live { background: var(--red); }
   .chip.dry { background: var(--green); }
@@ -77,8 +78,8 @@
   .kvrow { display: flex; justify-content: space-between; gap: 10px; }
   .kvrow span:first-child { color: var(--label); }
   .kvrow span:last-child { color: var(--ink); font-variant-numeric: tabular-nums; }
-  .kvrow span.up:last-child { color: var(--green); }
-  .kvrow span.down:last-child, .kvrow span.warn:last-child { color: var(--red); }
+  .kvrow span.up:last-child { color: var(--up); }
+  .kvrow span.down:last-child, .kvrow span.warn:last-child { color: var(--down); }
 
   /* Ticket. */
   .ticket { display: grid; gap: 12px; }
@@ -119,12 +120,13 @@
   th.r, td.r { text-align: right; }
   .status { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--label); }
   .status.armed { color: var(--line-text); }
-  .status.filled { color: var(--green); }
-  .status.failed, .status.unconfirmed { color: var(--red); }
+  .status.filled { color: var(--up); }
+  .status.failed, .status.unconfirmed { color: var(--down); }
   .note { color: var(--label); font-size: 12px; }
   .cancel { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink-2); cursor: pointer; }
   .table-wrap { overflow-x: auto; }
   .credit { font-size: 11px; color: rgba(225, 195, 187, 0.7); padding: 0 2px; }
+  .credit a { color: inherit; }
   .credit a { color: inherit; }
   @media (max-width: 999px) { .credit { order: 5; } }
   @media (max-width: 640px) { .hide-sm { display: none; } }
@@ -256,7 +258,7 @@ function initChart() {
     timeScale: { borderColor: cssVar('--border'), timeVisible: true, secondsVisible: false },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
   })
-  const up = cssVar('--green'), down = cssVar('--red')
+  const up = cssVar('--candle-up'), down = cssVar('--candle-down')
   series = chart.addCandlestickSeries({ upColor: up, downColor: down, borderUpColor: up, borderDownColor: down, wickUpColor: up, wickDownColor: down })
   // Click anywhere on the chart to use that price as the trigger.
   chart.subscribeClick((p) => {
@@ -348,7 +350,7 @@ function renderChart() {
   for (const l of lines) series.removePriceLine(l)
   lines = []
   for (const o of state.orders.filter((o) => o.status === 'armed' && o.symbol === m.symbol)) {
-    lines.push(series.createPriceLine({ price: o.triggerPx, color: cssVar(o.isLong ? '--green' : '--red'), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: `${o.isLong ? 'Long' : 'Short'} ${o.when === 'below' ? '≤' : '≥'}` }))
+    lines.push(series.createPriceLine({ price: o.triggerPx, color: cssVar(o.isLong ? '--up' : '--down'), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: `${o.isLong ? 'Long' : 'Short'} ${o.when === 'below' ? '≤' : '≥'}` }))
   }
   const trig = Number($('trigger').value)
   if (form.touched && trig > 0) lines.push(series.createPriceLine({ price: trig, color: cssVar('--line'), lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'New' }))

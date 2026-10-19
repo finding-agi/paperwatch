@@ -65,7 +65,7 @@
   .site-wallets img, .site-wallets .ph { width: 28px; height: 28px; border-radius: 7px; flex: none; }
   .site-wallets .ph { display: grid; place-items: center; color: #fff; font-weight: 800; font-size: 14px; }
   .site-wallets .tag { margin-left: auto; font-size: 12px; font-weight: 600; color: var(--label, #736c5e); }
-  .site-wallets .tag.ok { color: var(--green, #395e3d); }
+  .site-wallets .tag.ok { color: var(--up, #2f5a36); }
   .site-wallets .missing { opacity: 0.75; }
   .site-dialog .fine { font-size: 12px; color: var(--label, #736c5e); }
   .site-toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 80; max-width: calc(100% - 32px); background: var(--ink, #211b14); color: #fff; padding: 10px 14px; border-radius: 3px; font-size: 14px; }
