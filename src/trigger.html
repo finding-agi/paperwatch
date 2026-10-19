@@ -73,6 +73,13 @@
   .seg button.on { background: var(--raised); color: var(--ink); }
   #chart { height: 540px; position: relative; }
   @media (max-width: 999px) { #chart { height: 340px; } }
+  /* Position tags on the chart: side, leverage and live PnL at the entry line, with a tiny orange × that closes it. */
+  #pos-tags { position: absolute; inset: 0; z-index: 4; pointer-events: none; }
+  .pos-tag { position: absolute; transform: translateY(-50%); display: flex; align-items: center; gap: 6px; padding: 1px 4px 1px 7px; border-radius: 3px; font-size: 11px; font-weight: 700; color: #fff; white-space: nowrap; pointer-events: auto; font-variant-numeric: tabular-nums; }
+  .pos-tag.long { background: var(--green); }
+  .pos-tag.short { background: var(--red); }
+  .pos-tag button { font: inherit; font-size: 12px; line-height: 1; width: 15px; height: 15px; padding: 0; border: 0; border-radius: 2px; background: #fbf8f2; color: var(--line); cursor: pointer; font-weight: 800; }
+  .pos-tag button:hover { background: var(--line); color: #fff; }
   .chart-tip { position: absolute; left: 12px; top: 10px; z-index: 3; font-size: 12px; color: var(--label); background: rgba(251, 248, 242, 0.85); padding: 3px 8px; border-radius: 3px; pointer-events: none; }
 
   /* Account box. */
@@ -146,7 +153,6 @@
   .table-wrap { overflow-x: auto; }
   .credit { font-size: 11px; color: rgba(225, 195, 187, 0.7); padding: 0 2px; }
   .credit a { color: inherit; }
-  .credit a { color: inherit; }
   @media (max-width: 999px) { .credit { order: 5; } }
   @media (max-width: 640px) { .hide-sm { display: none; } }
 </style>
@@ -179,7 +185,7 @@
           <div class="kv hide-sm">Queue<b class="num" id="queue">—</b></div>
           <div class="grow"><div class="seg" id="tf"><button data-v="300">5m</button><button data-v="900" class="on">15m</button><button data-v="3600">1h</button><button data-v="14400">4h</button></div><span class="chip mock" title="Hyperliquid candles (the book Papertrade prices from); the last candle follows the live mid">Hyperliquid</span></div>
         </div>
-        <div id="chart"><div class="chart-tip" id="chart-tip">Click chart to set Limit Order</div></div>
+        <div id="chart"><div class="chart-tip" id="chart-tip">Click chart to set Limit Order</div><div id="pos-tags"></div></div>
       </div>
 
       <div class="card orders-card">
@@ -190,7 +196,7 @@
         </table></div>
         <div class="muted" id="orders-empty" style="padding: 12px 8px 2px;"></div>
       </div>
-      <div class="credit">Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView</a> Lightweight Charts™</div>
+      <div class="credit">Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener" title="TradingView Lightweight Charts™ Copyright (c) TradingView, Inc.">TradingView™</a></div>
     </div>
 
     <div class="right">
@@ -294,6 +300,9 @@ function initChart() {
   const up = cssVar('--candle-up'), down = cssVar('--candle-down')
   series = chart.addCandlestickSeries({ upColor: up, downColor: down, borderUpColor: up, borderDownColor: down, wickUpColor: up, wickDownColor: down })
   // Click anywhere on the chart to use that price as the trigger.
+  // Keep the position tags on their lines while the chart pans, zooms or resizes.
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => requestAnimationFrame(renderPosTags))
+  new ResizeObserver(() => requestAnimationFrame(renderPosTags)).observe($('chart'))
   chart.subscribeClick((p) => {
     if (!p.point) return
     const price = series.coordinateToPrice(p.point.y)
@@ -378,14 +387,51 @@ function renderChart() {
     loadCandles(key, m.symbol, form.tf)
     hlResubscribe()
   }
-  // Price lines: armed orders on this market, plus the trigger being typed.
+  // Price lines: open positions (solid, at entry, with live PnL), armed limit orders (dashed), the limit being typed.
   for (const l of lines) series.removePriceLine(l)
   lines = []
+  for (const p of (state.account?.open ?? []).filter((p) => p.symbol === m.symbol)) {
+    lines.push(series.createPriceLine({ price: p.entryPx, color: cssVar(p.isLong ? '--up' : '--down'), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: '' }))
+  }
+  renderPosTags()
   for (const o of state.orders.filter((o) => o.status === 'armed' && o.symbol === m.symbol)) {
     lines.push(series.createPriceLine({ price: o.triggerPx, color: cssVar(o.isLong ? '--up' : '--down'), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: `${o.isLong ? 'Long' : 'Short'} ${o.when === 'below' ? '≤' : '≥'}` }))
   }
   const trig = Number($('trigger').value)
   if (form.type === 'limit' && form.touched && trig > 0) lines.push(series.createPriceLine({ price: trig, color: cssVar('--line'), lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'New' }))
+}
+
+// Position tags drawn over the chart at each entry price, just left of the price axis. The × shows only when this
+// wallet can close (signed in, trading on).
+function renderPosTags() {
+  const box = $('pos-tags')
+  const m = market()
+  const list = series && m && state ? (state.account?.open ?? []).filter((p) => p.symbol === m.symbol) : []
+  const canClose = Boolean(state?.wallet) && state.wallet === state.view && state.trading?.status === 'active'
+  const right = series ? chart.priceScale('right').width() + 6 : 0
+  const height = series ? $('chart').clientHeight - chart.timeScale().height() : 0
+  // Update tags in place (keyed by position id) rather than rebuilding them, so a click is never lost mid-refresh.
+  const keep = new Set()
+  for (const p of list) {
+    const y = series.priceToCoordinate(p.entryPx)
+    if (y == null || y < 8 || y > height - 8) continue
+    keep.add(p.id)
+    let tag = box.querySelector(`[data-pos="${CSS.escape(p.id)}"]`)
+    if (!tag) {
+      tag = document.createElement('div')
+      tag.dataset.pos = p.id
+      tag.innerHTML = '<span></span><button type="button" title="Close this position at market" aria-label="Close position">×</button>'
+      tag.querySelector('button').dataset.close = p.id
+      box.appendChild(tag)
+    }
+    tag.className = `pos-tag ${p.isLong ? 'long' : 'short'}`
+    tag.style.top = `${y.toFixed(1)}px`
+    tag.style.right = `${right}px`
+    const pnl = p.pnlUsd == null ? '' : ` ${p.pnlUsd >= 0 ? '+' : '-'}$${Math.abs(p.pnlUsd).toFixed(2)}`
+    tag.firstChild.textContent = `${p.isLong ? 'Long' : 'Short'} ${p.leverage}×${pnl}${p.closing ? ' · closing…' : ''}`
+    tag.querySelector('button').hidden = !canClose || p.closing
+  }
+  for (const tag of [...box.children]) if (!keep.has(tag.dataset.pos)) tag.remove()
 }
 
 // ---- ticket -----------------------------------------------------------------------------------------------------------
@@ -576,18 +622,23 @@ const setLev = (v) => { $('lev-in').value = v; $('lev').value = Math.min(v, Numb
 for (const b of document.querySelectorAll('[data-l]')) b.onclick = () => setLev(Number(b.dataset.l))
 $('lev').oninput = () => setLev(Number($('lev').value))
 $('lev-in').oninput = () => { $('lev').value = Math.min(Number($('lev-in').value) || 1, Number($('lev').max)); renderForm() }
+// One click, like Papertrade: the close goes out at market. Used by the table's Close and the chart's ×.
+async function closePosition(id, button) {
+  button.disabled = true
+  if (button.textContent === 'Close') button.textContent = 'Closing…'
+  try {
+    const r = await api(`/api/positions/${id}/close`, {})
+    if (r.dry) W().toast('Dry run: close not sent')
+  } catch (err) { showError(err.message) } finally {
+    // The chart's × stays in place across refreshes; free it again once the request is done (the tag then shows "closing…").
+    if (button.textContent === '×') button.disabled = false
+  }
+  return poll()
+}
+$('pos-tags').onclick = (e) => { const id = e.target.dataset?.close; if (id) closePosition(id, e.target) }
 $('orders').onclick = async (e) => {
   const closeId = e.target.dataset?.close
-  if (closeId) {
-    // One click, like Papertrade: the close goes out at market.
-    e.target.disabled = true
-    e.target.textContent = 'Closing…'
-    try {
-      const r = await api(`/api/positions/${closeId}/close`, {})
-      if (r.dry) W().toast('Dry run: close not sent')
-    } catch (err) { showError(err.message) }
-    return poll()
-  }
+  if (closeId) return closePosition(closeId, e.target)
   const id = e.target.dataset?.id
   if (!id) return
   try { await api(`/api/orders/${id}/cancel`, {}); poll() } catch (err) { showError(err.message) }
