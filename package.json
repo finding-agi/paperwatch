@@ -26,10 +26,13 @@
   "dependencies": {
     "@fontsource-variable/manrope": "5.2.8",
     "lightweight-charts": "4.2.0",
+    "pg": "8.23.1",
     "viem": "2.56.9"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.3.16",
     "@types/node": "24.19.0",
+    "@types/pg": "8.23.1",
     "typescript": "5.9.3"
   }
 }

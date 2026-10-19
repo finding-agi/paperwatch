@@ -14,6 +14,7 @@ import { sideHeadroomUsd } from './risk.ts'
 import { baseHeaders, serveAsset, serveChartJs, servePage, serveSiteJs } from './site.ts'
 import { startQueueRelay } from './queue-viz.ts'
 import { CandleStore } from './candles.ts'
+import { Db } from './db.ts'
 import { NonceSource } from './state.ts'
 import { UserStore, issueToken, openKey, readToken, sealKey, signInMessage, type UserRecord } from './users.ts'
 import { log, makeClient, usd } from './bot.ts'
@@ -193,9 +194,10 @@ export function holdReason(
   return null
 }
 
-function loadOrders(): TriggerOrder[] {
-  if (!existsSync(ORDERS_FILE())) return []
-  const orders = JSON.parse(readFileSync(ORDERS_FILE(), 'utf8')) as TriggerOrder[]
+/** Orders from the database when it has any, else from trigger-orders.json (the first run copies them in). */
+async function loadOrders(db: Db | null): Promise<TriggerOrder[]> {
+  const rows = db ? [...(await db.load<TriggerOrder>('orders')).values()].sort((a, b) => a.createdAt - b.createdAt) : []
+  const orders = rows.length ? rows : existsSync(ORDERS_FILE()) ? (JSON.parse(readFileSync(ORDERS_FILE(), 'utf8')) as TriggerOrder[]) : []
   // A restart mid-send can't tell whether the intent reached the relayer: never send those again.
   for (const o of orders) {
     if (!o.wallet && o.status === 'armed') Object.assign(o, { status: 'cancelled', note: 'placed before wallet accounts; place it again' })
@@ -204,11 +206,12 @@ function loadOrders(): TriggerOrder[] {
   return orders
 }
 
-function saveOrders(orders: TriggerOrder[]): void {
+function saveOrders(orders: TriggerOrder[], db: Db | null): void {
   mkdirSync(STATE_DIR, { recursive: true })
   const tmp = `${ORDERS_FILE()}.tmp`
   writeFileSync(tmp, JSON.stringify(orders, null, 2))
   renameSync(tmp, ORDERS_FILE())
+  db?.sync('orders', orders.map((o) => [o.id, o]))
 }
 
 const short = (w: string) => `${w.slice(0, 6)}…${w.slice(-4)}`
@@ -252,7 +255,21 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   if (authSecret.length < 32) throw new Error('set PT_AUTH_SECRET to a random string of 32+ characters (signs sign-in cookies)')
   const keySecret = process.env.PT_KEY_SECRET || (PUBLIC || opts.live ? '' : 'local-dry-run-only-not-a-real-secret')
   if (keySecret.length < 32) throw new Error('set PT_KEY_SECRET to a random string of 32+ characters (encrypts trading keys at rest)')
-  const users = new UserStore()
+  // Postgres (DATABASE_URL) holds users, orders and the activity log; the JSON files on the volume stay as a fallback copy.
+  const db = Db.fromEnv()
+  if (db) await db.init()
+  const users = await UserStore.open(db)
+  const track = (type: string, wallet: string | null, data: Record<string, unknown> = {}) => db?.event(type, wallet, data)
+  // Before anything goes to the relayer, every save so far must be in the database, so a restart can't send it twice.
+  const dbReady = async () => {
+    try {
+      await db?.flush()
+      return true
+    } catch (err) {
+      log('warn', errMsg(err))
+      return false
+    }
+  }
 
   let trading = await getTradingState()
   let tradingAt = Date.now()
@@ -299,7 +316,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   const pub = new PublicStream()
   pub.start()
 
-  let orders = loadOrders()
+  let orders = await loadOrders(db)
   const persist = () => {
     const done = orders.filter((o) => o.status !== 'armed' && o.status !== 'sending' && o.status !== 'sent')
     const keep = KEEP_DONE * Math.max(1, new Set(orders.map((o) => o.wallet)).size)
@@ -307,8 +324,9 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       const drop = new Set(done.sort((a, b) => a.createdAt - b.createdAt).slice(0, done.length - keep))
       orders = orders.filter((o) => !drop.has(o))
     }
-    saveOrders(orders)
+    saveOrders(orders, db)
   }
+  if (db) persist() // the first run with a database copies trigger-orders.json in; restart fixes are saved too
 
   // ---- accounts: one read-only Papertrade account feed per wallet in use ----------------------------------------------
   const accounts = new Map<string, Account>()
@@ -376,8 +394,15 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   }
 
   const settle = (o: TriggerOrder, update: Partial<TriggerOrder>, line: string) => {
+    const was = o.status
     Object.assign(o, update)
     persist()
+    if (o.status !== was) {
+      track(`order_${o.status}`, o.wallet, {
+        id: o.id, symbol: o.symbol, side: o.isLong ? 'long' : 'short', kind: o.kind ?? 'limit', leverage: o.leverage,
+        marginUsd: o.marginUsd, triggerPx: o.triggerPx, firedPx: o.firedPx, intentId: o.intentId, fill: o.fill, note: o.note,
+      })
+    }
     log(update.status === 'filled' ? 'FILL' : 'trig', `${describe(o)}: ${line}`)
   }
 
@@ -427,6 +452,12 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       })
       intentId = signed.intentId
       o.intentId = intentId
+      persist()
+      if (!(await dbReady())) {
+        o.attempts--
+        settle(o, { status: 'armed', intentId: undefined, note: 'waiting for the database; re-armed' }, 'database behind; not sent')
+        return
+      }
       await submitIntent('openPosition', signed.signed, intentId)
     } catch (err) {
       // A relayer refusal means nothing is queued; anything else (timeout, network) might have reached it.
@@ -518,7 +549,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   // successful transfer of at least the fee to the fee address to the wallet that sent it. A user just sends HYPE and
   // trading unlocks on its own. It looks back a minute when it starts, and the unlock window can also check a hash.
   const scanFile = join(STATE_DIR, 'fee-scan.json')
-  let scanned: number | null = existsSync(scanFile) ? Number(JSON.parse(readFileSync(scanFile, 'utf8')).block) : null
+  const scanSaved = (await db?.get<{ block: number }>('fee-scan')) ?? (existsSync(scanFile) ? JSON.parse(readFileSync(scanFile, 'utf8')) : null)
+  let scanned: number | null = scanSaved ? Number(scanSaved.block) : null
   const someoneWaiting = () =>
     [...accounts.values()].some((a) => Date.now() - a.usedAt < 10 * 60_000 && !feeOk(a.wallet))
   const scanFees = async () => {
@@ -540,12 +572,14 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
             const user = users.getOrCreate(tx.from)
             user.fee = { tx: tx.hash.toLowerCase() as Hex, paidAt: Date.now(), wei: String(tx.value) }
             users.save()
+            track('fee_paid', user.wallet, { tx: tx.hash, wei: String(tx.value), via: 'scan' })
             log('fee', `${short(user.wallet)} paid ${formatEther(tx.value)} HYPE in block ${block.number} (${tx.hash.slice(0, 10)}); trading unlocked`)
           }
         }
         scanned = last
         mkdirSync(STATE_DIR, { recursive: true })
         writeFileSync(scanFile, JSON.stringify({ block: scanned }))
+        db?.put('fee-scan', { block: scanned })
       }
     } catch (err) {
       log('warn', `fee scan: ${errMsg(err)}`)
@@ -717,6 +751,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         const user = users.getOrCreate(body.wallet)
         users.save()
         account(user.wallet)
+        track('sign_in', user.wallet)
         log('login', short(user.wallet))
         return json(res, 200, { wallet: user.wallet }, { 'set-cookie': sessionCookie(issueToken(user.wallet, authSecret, AUTH_TTL_MS), AUTH_TTL_MS / 1000) })
       }
@@ -742,6 +777,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         const user = users.getOrCreate(wallet!)
         user.fee = { tx: hash.toLowerCase() as Hex, paidAt: Date.now(), wei: String(tx.value) }
         users.save()
+        track('fee_paid', user.wallet, { tx: hash.toLowerCase(), wei: String(tx.value), via: 'hash' })
         log('fee', `${short(user.wallet)} paid ${formatEther(tx.value)} HYPE (${hash.slice(0, 10)})`)
         return json(res, 200, { paid: true })
       }
@@ -798,6 +834,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         user.key = { address: pending.address, sealed: pending.sealed, expiry: Number(p.expiry), submittedAt: Date.now(), ...(opts.live ? {} : { registeredAt: Date.now() }) }
         delete user.pendingKey
         users.save()
+        track('trading_enabled', user.wallet, { key: pending.address, dry: !opts.live })
         log('key', `${short(user.wallet)} trading key ${short(pending.address)} ${opts.live ? 'submitted' : 'approved (dry: not sent)'}`)
         if (opts.live) {
           const keyId = pending.address.toLowerCase()
@@ -821,6 +858,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         delete user.key
         users.save()
         for (const o of orders.filter((o) => o.wallet === user.wallet && o.status === 'armed')) settle(o, { status: 'cancelled', note: 'trading turned off' }, 'cancelled (trading off)')
+        track('trading_disabled', user.wallet, { key: keyAddress })
         log('key', `${short(user.wallet)} turned trading off (key ${short(keyAddress)})`)
         return json(res, 200, { tx: { to: CONTRACTS.sessionKeyManager, data: encodeFunctionData({ abi: REVOKE_ABI, functionName: 'revokeSessionKey', args: [keyAddress] }) } })
       }
@@ -839,6 +877,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         if (typeof o === 'string') return json(res, 400, { error: o })
         orders.push(o)
         persist()
+        track('order_placed', o.wallet, { id: o.id, symbol: o.symbol, side: o.isLong ? 'long' : 'short', kind: o.kind ?? 'limit', leverage: o.leverage, triggerPx: o.triggerPx, marginPct: o.marginPct, fixedMarginUsd: o.fixedMarginUsd })
         log('place', `${describe(o)}, expires ${new Date(o.expiresAt).toISOString()}, deadline ${o.deadlineSec}s (mid ${mid!.px})`)
         return json(res, 200, o)
       }
@@ -867,6 +906,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           nonce: nonces.take(),
           deadline: deadlineFromNow(INTENT_TTL_SEC),
         })
+        if (!(await dbReady())) return json(res, 503, { error: 'Saving is behind right now; try the close again in a few seconds.' })
         try {
           await submitIntent('closePositions', signed.signed, signed.intentId)
         } catch (err) {
@@ -875,6 +915,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           throw err
         }
         closing.set(id, { wallet: wallet!, intentId: signed.intentId, at: Date.now() })
+        track('position_close', wallet!, { positionId: id, intentId: signed.intentId })
         log('close', `${short(wallet!)} #${id} sent ${signed.intentId.slice(0, 10)}`)
         return json(res, 200, { intentId: signed.intentId })
       }
