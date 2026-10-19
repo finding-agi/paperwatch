@@ -101,3 +101,32 @@ test('the unlock fee only counts a successful HyperEVM transfer of enough HYPE f
   assert.match(feePaymentProblem({ ...ok, to: null }, 'success', me, fee, min)!, /fee wallet/)
   assert.match(feePaymentProblem({ ...ok, chainId: 1 }, 'success', me, fee, min)!, /HyperEVM/)
 })
+
+test('the fee watcher picks out only transfers of at least the fee straight to the fee address', async () => {
+  const { feePayments } = await import('../src/trigger.ts')
+  const fee = '0xEFF64D64a23487f72370Df85F3ceA01941453CdE'
+  const min = 10n ** 17n
+  const txs = [
+    { hash: '0x1', to: fee.toLowerCase(), value: min },
+    { hash: '0x2', to: fee, value: min * 3n },
+    { hash: '0x3', to: fee, value: min - 1n }, // too little
+    { hash: '0x4', to: '0x' + '9'.repeat(40), value: min }, // somewhere else
+    { hash: '0x5', to: null, value: min }, // contract creation
+  ]
+  assert.deepEqual(feePayments(txs, fee, min).map((t) => t.hash), ['0x1', '0x2'])
+})
+
+test('market orders go out at the live mid; every order needs at least $1,000 of notional', () => {
+  const mkt = newOrder({ ...input, type: 'market', triggerPx: undefined, marginUsd: 40, leverage: 25 }, BTC, 80_000, 0)
+  assert.ok(typeof mkt !== 'string')
+  assert.equal(mkt.kind, 'market')
+  assert.equal(mkt.triggerPx, 80_000)
+  assert.equal(mkt.expiresAt, 3 * 60_000) // dropped if it can't go out within 3 minutes
+  const lim = newOrder({ ...input, marginUsd: 40, leverage: 25 }, BTC, 80_000, 0)
+  assert.ok(typeof lim !== 'string')
+  assert.equal(lim.kind, 'limit')
+  assert.match(newOrder({ ...input, type: 'market', marginUsd: 39.99, leverage: 25 }, BTC, 80_000) as string, /at least \$1,000/)
+  assert.match(newOrder({ ...input, marginUsd: 10, leverage: 50 }, BTC, 80_000) as string, /at least \$1,000/)
+  // A higher protocol minimum wins over the $1,000 floor.
+  assert.match(newOrder({ ...input, marginUsd: 40, leverage: 30 }, BTC, 80_000, 0, undefined, 1500) as string, /at least \$1,500/)
+})

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Limit Intents</title>
+<title>Trade · Paperwatch</title>
 <link rel="icon" type="image/png" href="/assets/favicon.png">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <script src="/vendor/lightweight-charts.js"></script>
@@ -19,7 +19,7 @@
   [hidden] { display: none !important; }
   body { margin: 0; background: var(--page); color: var(--ink-2); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   .wrap { max-width: 1600px; margin: 0 auto; padding: 12px 16px 16px; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 3px; padding: 14px; min-width: 0; }
+  .card { background: var(--surface); border: 1px solid var(--line); /* orange stroke on every widget */ border-radius: 3px; padding: 14px; min-width: 0; }
   h2 { margin: 0; color: var(--ink); font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
   .muted { color: var(--label); font-size: 13px; }
   .num { font-variant-numeric: tabular-nums; }
@@ -31,6 +31,18 @@
   .chip.dry { background: var(--green); }
   .chip.mock { background: var(--raised); color: var(--label); border: 1px solid var(--border); }
 
+  /* Unlock window: same look as the wallet picker (site.js .site-modal / .site-dialog). */
+  .unlock-text { font-size: 15px; color: var(--ink); }
+  .unlock-addr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: stretch; }
+  .unlock-addr code { font: 13px/1.4 ui-monospace, Menlo, monospace; word-break: break-all; padding: 10px 12px; background: var(--raised); border: 1px solid var(--border); border-radius: 3px; color: var(--ink); }
+  .unlock-status { font-size: 13px; font-weight: 600; color: var(--line-text); display: flex; align-items: center; gap: 8px; }
+  .unlock-status::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--line); animation: pulse 1.2s ease-in-out infinite; }
+  .unlock-status.done { color: var(--green); }
+  .unlock-status.done::before { background: var(--green); animation: none; }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+  .unlock-hash summary { cursor: pointer; font-size: 12px; color: var(--label); }
+  .unlock-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; margin-top: 8px; }
+  .unlock-row input { font: 13px ui-monospace, Menlo, monospace; padding: 8px 10px; border: 1px solid var(--border); border-radius: 3px; background: var(--raised); color: var(--ink); min-width: 0; }
   .link { font: inherit; font-size: inherit; border: 0; padding: 0; background: none; color: var(--line-text); cursor: pointer; text-decoration: underline; }
 
   /* Layout: chart and orders on the left, account and ticket on the right. */
@@ -83,6 +95,11 @@
 
   /* Ticket. */
   .ticket { display: grid; gap: 12px; }
+  /* Market / Limit: a tab-style switch above the long/short buttons. */
+  .otype { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--border); margin: -4px -14px 0; padding: 0 14px; }
+  .otype button { font: inherit; font-size: 14px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 8px 0 10px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--label); cursor: pointer; }
+  .otype button.on { color: var(--ink); border-bottom-color: var(--line); }
+  .pair.one { grid-template-columns: 1fr; }
   .side { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
   .side button { font: inherit; font-size: 15px; font-weight: 700; padding: 10px 0; border: 0; background: transparent; color: var(--label); cursor: pointer; }
   .side button.on.long { background: var(--green); color: #fff; }
@@ -135,6 +152,20 @@
 <body data-page="trigger">
 <script src="/site.js"></script>
 <div class="wrap">
+  <div class="site-modal" id="unlock-modal" hidden>
+    <div class="site-dialog" role="dialog" aria-modal="true" aria-label="Unlock trading">
+      <h3>Unlock trading <button type="button" id="unlock-x" aria-label="Close">×</button></h3>
+      <div class="unlock-text">Send <b><span id="unlock-amount">0.1</span> HYPE</b> to this address to unlock.</div>
+      <div class="unlock-addr"><code id="unlock-address"></code><button type="button" class="mini" id="unlock-copy">Copy</button></div>
+      <div class="fine">Send it on HyperEVM from your connected wallet, <b id="unlock-from"></b>. Trading unlocks on its own once it confirms.</div>
+      <div class="unlock-status" id="unlock-status">Waiting for your payment…</div>
+      <details class="unlock-hash">
+        <summary>Already sent? Check a transaction</summary>
+        <div class="unlock-row"><input id="unlock-hash" placeholder="0x… transaction hash" autocomplete="off" spellcheck="false"><button type="button" class="mini" id="unlock-check">Check</button></div>
+      </details>
+    </div>
+  </div>
+
   <div id="app">
     <div class="left">
       <div class="card chart-card">
@@ -184,11 +215,11 @@
       </div>
 
       <div class="card ticket">
-        <h2>Limit Intent</h2>
+        <div class="otype" id="otype"><button data-v="market">Market</button><button data-v="limit">Limit</button></div>
         <div class="side" id="side"><button data-v="long" class="long">Long</button><button data-v="short" class="short">Short</button></div>
 
-        <div>
-          <div class="field-label"><span>Trigger price</span></div>
+        <div id="trigger-field">
+          <div class="field-label"><span>Limit price</span></div>
           <input type="number" id="trigger" inputmode="decimal" step="any">
         </div>
 
@@ -206,12 +237,12 @@
 
         <div class="rows" style="margin-top: 0;">
           <div class="kvrow"><span>Order value</span><span id="value">—</span></div>
-          <div class="kvrow"><span>Bust price (at trigger)</span><span id="bust">—</span></div>
+          <div class="kvrow"><span id="bust-label">Bust price (at limit)</span><span id="bust">—</span></div>
           <div class="kvrow"><span>OI room on this side</span><span id="room">—</span></div>
         </div>
 
         <div class="pair">
-          <label>Expires<select id="expires"><option value="1">1 hour</option><option value="6">6 hours</option><option value="24" selected>24 hours</option><option value="72">3 days</option><option value="168">7 days</option></select></label>
+          <label id="expires-field">Expires<select id="expires"><option value="1">1 hour</option><option value="6">6 hours</option><option value="24" selected>24 hours</option><option value="72">3 days</option><option value="168">7 days</option></select></label>
           <label>Max wait once sent<select id="deadline"><option value="30">30 s</option><option value="60" selected>60 s</option><option value="120">2 min</option><option value="300">5 min</option></select></label>
         </div>
 
@@ -226,7 +257,7 @@ const $ = (id) => document.getElementById(id)
 const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
 const store = { get: (k) => { try { return localStorage.getItem(k) } catch { return null } }, set: (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v) } catch {} } }
 let state = null
-const form = { symbol: store.get('trigger-symbol') || 'BTC', side: 'long', touched: false, marginTouched: false, tab: 'open', tf: 900 }
+const form = { symbol: store.get('trigger-symbol') || 'BTC', side: 'long', type: store.get('trigger-type') === 'limit' ? 'limit' : 'market', touched: false, marginTouched: false, tab: 'open', tf: 900 }
 
 const money = (x, d = 2) => x == null || !Number.isFinite(x) ? '—' : (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })
 const big = (x) => x == null ? '—' : x >= 1e9 ? `$${(x / 1e9).toFixed(2)}B` : x >= 1e6 ? `$${(x / 1e6).toFixed(1)}M` : x >= 1e3 ? `$${(x / 1e3).toFixed(1)}K` : money(x, 0)
@@ -267,6 +298,7 @@ function initChart() {
     if (price == null) return
     $('trigger').value = Number(price).toFixed(price >= 1000 ? 1 : 2)
     form.touched = true
+    setType('limit') // clicking a price means a limit order
     renderForm()
   })
 }
@@ -351,7 +383,7 @@ function renderChart() {
     lines.push(series.createPriceLine({ price: o.triggerPx, color: cssVar(o.isLong ? '--up' : '--down'), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: `${o.isLong ? 'Long' : 'Short'} ${o.when === 'below' ? '≤' : '≥'}` }))
   }
   const trig = Number($('trigger').value)
-  if (form.touched && trig > 0) lines.push(series.createPriceLine({ price: trig, color: cssVar('--line'), lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'New' }))
+  if (form.type === 'limit' && form.touched && trig > 0) lines.push(series.createPriceLine({ price: trig, color: cssVar('--line'), lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: 'New' }))
 }
 
 // ---- ticket -----------------------------------------------------------------------------------------------------------
@@ -373,7 +405,13 @@ function renderForm() {
   $('lev-max').textContent = `max ${m.maxLeverage}×`
   $('avail').textContent = money(free())
 
-  const trig = Number($('trigger').value)
+  const isMarket = form.type === 'market'
+  for (const b of $('otype').children) b.classList.toggle('on', b.dataset.v === form.type)
+  $('trigger-field').hidden = isMarket
+  $('expires-field').hidden = isMarket
+  $('expires-field').parentElement.classList.toggle('one', isMarket)
+  // A market order fills around the live price; a limit fires at its price.
+  const trig = isMarket ? (liveMid[m.symbol] ?? m.mid) : Number($('trigger').value)
   const margin = Number($('margin').value)
   const lev = Number($('lev-in').value)
   for (const b of document.querySelectorAll('[data-l]')) b.classList.toggle('on', Number(b.dataset.l) === lev)
@@ -384,6 +422,7 @@ function renderForm() {
   const buf = m.bustBuffer ?? 0
   const bust = form.side === 'long' ? trig * (1 - 1 / lev) * (1 + buf) : trig * (1 + 1 / lev) * (1 - buf)
   $('bust').textContent = trig > 0 && lev >= 1 ? px(bust) : '—'
+  $('bust-label').textContent = isMarket ? 'Bust price (at current price)' : 'Bust price (at limit)'
   const room = form.side === 'long' ? m.roomLong : m.roomShort
   $('room').textContent = room == null ? 'uncapped' : big(room)
   $('room').className = room != null && room < value ? 'warn' : ''
@@ -392,13 +431,15 @@ function renderForm() {
   if (stage() !== 'ready') problem = ''
   else if (margin > maxMargin()) problem = `Only ${money(maxMargin())} can go to margin right now ($1 is kept back).`
   else if (margin > 0 && margin < state.minMarginUsd) problem = `Minimum margin is ${money(state.minMarginUsd)}.`
-  else if (value > 0 && value < state.minNotionalUsd) problem = `Minimum position is ${money(state.minNotionalUsd, 0)}.`
+  else if (!(margin > 0)) problem = 'Enter a margin.'
+  else if (value < Math.max(1000, state.minNotionalUsd)) problem = `Position size (margin × leverage) must be at least ${money(Math.max(1000, state.minNotionalUsd), 0)}.`
   else if (lev > m.maxLeverage) problem = `${m.symbol} max leverage is ${m.maxLeverage}×.`
   else if (!m.openable) problem = `${m.symbol} opens are paused right now.`
   if (!$('msg').dataset.sticky) $('msg').textContent = problem
   const st = stage()
-  $('place').textContent = { connect: 'Connect Wallet', signin: 'Sign In', pay: `Unlock Trading · ${state.fee?.hype ?? ''} HYPE`, enable: 'Enable Trading', pending: 'Enabling trading…', ready: `Place ${form.side === 'long' ? 'Long' : 'Short'} Limit Intent` }[st]
-  $('place').disabled = st === 'pending' || busy
+  $('place').textContent = { connect: 'Connect Wallet', signin: 'Sign In', pay: 'Unlock Trading', enable: 'Enable Trading', pending: 'Enabling trading…', ready: `${isMarket ? 'Market' : 'Limit'} ${form.side === 'long' ? 'Long' : 'Short'} ${m.symbol}` }[st]
+  // Nothing goes out that Papertrade would refuse: under $1,000 notional, over the free margin, paused market.
+  $('place').disabled = st === 'pending' || busy || (st === 'ready' && Boolean(problem))
   $('place').classList.toggle('short', st === 'ready' && form.side === 'short')
   renderChart()
 }
@@ -437,9 +478,9 @@ function renderAccount() {
   $('queue').textContent = state.queued == null ? '—' : `${state.queued}${state.queued >= state.maxQueued ? ' ⚠' : ''}`
 }
 
-// Open: the account's live Papertrade positions (any source). Orders: limit intents still waiting or in flight.
-// History: finished limit intents.
-const ORDER_HEAD = '<tr><th>Side</th><th>Market</th><th class="r">Trigger</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th>Status</th><th class="hide-sm">Detail</th><th></th></tr>'
+// Open: the account's live Papertrade positions (any source). Orders: market and limit orders still waiting or in
+// flight. History: finished ones.
+const ORDER_HEAD = '<tr><th>Side</th><th>Market</th><th class="r">Price</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th>Status</th><th class="hide-sm">Detail</th><th></th></tr>'
 const POSITION_HEAD = '<tr><th>Side</th><th>Market</th><th class="r">Size</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th class="r">Entry</th><th class="r hide-sm">Mark</th><th class="r hide-sm">Bust</th><th class="r">PnL</th></tr>'
 
 function renderPositions(list) {
@@ -470,7 +511,7 @@ function renderOrders() {
   const list = form.tab === 'orders' ? open : state.orders.filter((o) => !open.includes(o))
   $('orders-head').innerHTML = ORDER_HEAD
   $('orders-empty').hidden = list.length > 0
-  $('orders-empty').textContent = form.tab === 'orders' ? 'No open limit intents.' : 'No history yet.'
+  $('orders-empty').textContent = form.tab === 'orders' ? 'No open orders.' : 'No history yet.'
   $('orders').innerHTML = list.map((o) => {
     let detail = o.status === 'armed' ? `expires in ${ago(o.expiresAt - now)}` : `placed ${ago(now - o.createdAt)} ago`
     if (o.fill) detail = `filled @ ${px(o.fill.entryPx)} after ${o.fill.waitedS}s`
@@ -479,7 +520,7 @@ function renderOrders() {
     return `<tr>
       <td class="${o.isLong ? 'up' : 'down'}"><b>${o.isLong ? 'Long' : 'Short'}</b></td>
       <td>${esc(o.symbol)}</td>
-      <td class="r">${o.when === 'below' ? '≤' : '≥'} ${px(o.triggerPx)}</td>
+      <td class="r">${o.kind === 'market' ? 'Market' : `${o.when === 'below' ? '≤' : '≥'} ${px(o.triggerPx)}`}</td>
       <td class="r">${margin != null ? money(margin) : `${Math.round(o.marginPct * 100)}%`}</td>
       <td class="r hide-sm">${o.leverage}×</td>
       <td><span class="status ${esc(o.status)}">${esc(o.status)}</span></td>
@@ -504,9 +545,7 @@ async function poll() {
     const browser = window.paperwatchWallet?.account
     if (state.wallet && browser !== undefined && browser !== state.wallet && walletReady) { await api('/api/auth/logout', {}); state = await api('/api/state' + (viewing ? `?wallet=${viewing}` : '')) }
     render()
-    // A payment sent earlier from this browser that never got confirmed: check it once.
-    const pending = stage() === 'pay' && !busy && store.get(feeTxKey())
-    if (pending && feeChecked !== pending) { feeChecked = pending; step(() => confirmFee(pending)) }
+    renderUnlock()
   } catch {}
   poll.t = setTimeout(poll, 1000)
 }
@@ -518,6 +557,8 @@ $('side').onclick = (e) => { const v = e.target.closest('button')?.dataset.v; if
 $('tf').onclick = (e) => { const v = Number(e.target.dataset?.v); if (!v) return; form.tf = v; for (const b of $('tf').children) b.classList.toggle('on', b === e.target); renderForm() }
 $('tabs').onclick = (e) => { const v = e.target.closest('button')?.dataset.v; if (!v) return; form.tab = v; renderOrders() }
 $('trigger').oninput = () => { form.touched = true; renderForm() }
+function setType(type) { form.type = type; store.set('trigger-type', type) }
+$('otype').onclick = (e) => { const v = e.target.closest('button')?.dataset.v; if (!v) return; setType(v); renderForm() }
 $('margin').oninput = () => { form.marginTouched = true; renderForm() }
 for (const b of document.querySelectorAll('[data-m]')) b.onclick = () => {
   const cur = Number($('margin').value) || 0
@@ -557,30 +598,31 @@ async function signIn() {
   await api('/api/auth/verify', { wallet: account, signature })
 }
 
-// One-time unlock: the wallet sends the fee in HYPE on HyperEVM; our server then checks that transaction on-chain.
-// The hash is kept in this browser until it's confirmed, so a closed tab or a slow block doesn't lose the payment.
-const feeTxKey = () => `paperwatch-fee-tx-${W().account}`
-async function payFee() {
-  let hash = store.get(feeTxKey())
-  if (!hash) {
-    await W().ensureChain()
-    hash = await W().provider.request({ method: 'eth_sendTransaction', params: [{ from: W().account, to: state.fee.address, value: state.fee.valueHex }] })
-    store.set(feeTxKey(), hash)
-  }
-  await confirmFee(hash)
+// One-time unlock: the user sends the fee in HYPE themselves, from their connected wallet, to the address shown.
+// The server watches HyperEVM for it and unlocks the sender; this window just shows the address and waits.
+function openUnlock() {
+  $('unlock-amount').textContent = state.fee.hype
+  $('unlock-address').textContent = state.fee.address
+  $('unlock-from').textContent = `${W().account.slice(0, 6)}…${W().account.slice(-4)}`
+  $('unlock-status').textContent = 'Waiting for your payment…'
+  $('unlock-status').className = 'unlock-status'
+  $('unlock-modal').hidden = false
 }
-async function confirmFee(hash) {
-  try {
-    await api('/api/fee/confirm', { hash })
-    store.set(feeTxKey(), null)
-  } catch (err) {
-    // A failed or wrong payment can't be retried as-is; forget it so the next click sends a fresh one.
-    if (!/not confirmed yet/i.test(err.message)) store.set(feeTxKey(), null)
-    throw err
-  }
+function renderUnlock() {
+  if ($('unlock-modal').hidden || !state.wallet || state.fee?.required) return
+  $('unlock-status').textContent = 'Payment received. Trading unlocked.'
+  $('unlock-status').className = 'unlock-status done'
+  setTimeout(() => ($('unlock-modal').hidden = true), 1500)
 }
-let feeChecked = ''
-window.addEventListener('paperwatch:wallet', () => (feeChecked = ''))
+$('unlock-x').onclick = () => ($('unlock-modal').hidden = true)
+$('unlock-modal').onclick = (e) => { if (e.target.id === 'unlock-modal') $('unlock-modal').hidden = true }
+$('unlock-copy').onclick = () => navigator.clipboard?.writeText(state.fee.address).then(() => W().toast('Address copied'))
+// Fallback if the watcher missed it: check a specific transaction.
+$('unlock-check').onclick = async () => {
+  const hash = $('unlock-hash').value.trim()
+  $('unlock-status').textContent = 'Checking that transaction…'
+  try { await api('/api/fee/confirm', { hash }); await poll() } catch (err) { $('unlock-status').textContent = err.message }
+}
 
 async function enableTrading() {
   await W().ensureChain() // the approval is for HyperEVM (chain 999); wallets refuse to sign it on another chain
@@ -597,7 +639,7 @@ async function step(fn) {
 
 $('acct').onclick = async (e) => {
   if (e.target.id !== 'trading-off') return
-  if (!confirm('Turn trading off? Your open limit intents are cancelled and Paperwatch deletes its trading key. Your wallet will then ask to revoke the key on Papertrade too (a small HyperEVM transaction, needs a little HYPE for gas).')) return
+  if (!confirm('Turn trading off? Your open orders are cancelled and Paperwatch deletes its trading key. Your wallet will then ask to revoke the key on Papertrade too (a small HyperEVM transaction, needs a little HYPE for gas).')) return
   try {
     const { tx } = await api('/api/trading/revoke', {})
     poll()
@@ -611,14 +653,14 @@ $('place').onclick = async () => {
   const st = stage()
   if (st === 'connect') return W().open()
   if (st === 'signin') return step(signIn)
-  if (st === 'pay') return step(payFee)
+  if (st === 'pay') return openUnlock()
   if (st === 'enable') return step(enableTrading)
   if (st !== 'ready') return
   const m = market()
-  const body = { symbol: form.symbol, side: form.side, triggerPx: Number($('trigger').value), marginUsd: Number($('margin').value),
+  const body = { type: form.type, symbol: form.symbol, side: form.side, triggerPx: Number($('trigger').value), marginUsd: Number($('margin').value),
     leverage: Number($('lev-in').value), expiresHours: Number($('expires').value), deadlineSec: Number($('deadline').value) }
   $('place').disabled = true
-  try { await api('/api/orders', body); form.touched = false; form.tab = 'orders'; poll() } catch (err) { showError(err.message) } finally { $('place').disabled = false }
+  try { await api('/api/orders', body); form.touched = false; form.tab = form.type === 'market' ? 'open' : 'orders'; poll() } catch (err) { showError(err.message) } finally { $('place').disabled = false }
 }
 
 hlConnect()

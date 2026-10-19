@@ -53,6 +53,8 @@ const FAILED_OUTCOMES = new Set(['failed', 'expired', 'cancelled'])
 // PT_FEE_EXEMPT (comma-separated) skip it. Without PT_FEE_ADDRESS there is no fee.
 const FEE_ADDRESS = process.env.PT_FEE_ADDRESS ? getAddress(process.env.PT_FEE_ADDRESS) : null
 const FEE_WEI = parseEther(process.env.PT_FEE_HYPE || '0.1')
+const FEE_SCAN_MS = 1000 // HyperEVM makes a small block every second
+const FEE_SCAN_BATCH = 6 // blocks read per pass, in parallel: catches up after a gap without hammering the RPC
 const FEE_EXEMPT = new Set((process.env.PT_FEE_EXEMPT ?? '').split(',').map((w) => w.trim().toLowerCase()).filter(Boolean))
 const PENDING_REWARD_ABI = [{ type: 'function', name: 'pendingReward', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] }] as const
 const REWARD_REFRESH_MS = 60_000
@@ -65,6 +67,8 @@ const errMsg = (err: unknown) => (err instanceof Error ? err.message.split('\n')
 export type OrderStatus = 'armed' | 'sending' | 'sent' | 'filled' | 'failed' | 'cancelled' | 'expired' | 'unconfirmed'
 export type TriggerOrder = {
   id: string
+  /** 'market' goes out on the next check at the live mid; 'limit' (or unset, for older orders) waits for its trigger. */
+  kind?: 'market' | 'limit'
   /** The Papertrade account (connected wallet) it trades. */
   wallet: Address
   symbol: string
@@ -95,6 +99,7 @@ export type OrderInput = {
   symbol?: unknown
   side?: unknown
   triggerPx?: unknown
+  type?: unknown
   marginPct?: unknown
   marginUsd?: unknown
   leverage?: unknown
@@ -103,10 +108,16 @@ export type OrderInput = {
 }
 
 /** Validate a new order from the page against the market and the current mid; returns the order or an error. */
-export function newOrder(input: OrderInput, inst: Instrument | undefined, midPx: number, now = Date.now(), wallet: Address = zeroAddress): TriggerOrder | string {
+/** Papertrade refuses opens under $1,000 of notional; checked when an order is placed, not only when it's sent. */
+export const MIN_NOTIONAL_USD = 1000
+const MARKET_EXPIRY_MS = 3 * 60_000 // a market order that can't go out within this (no OI room, balance) is dropped
+
+export function newOrder(input: OrderInput, inst: Instrument | undefined, midPx: number, now = Date.now(), wallet: Address = zeroAddress, minNotionalUsd = MIN_NOTIONAL_USD): TriggerOrder | string {
   if (!inst) return 'unknown market'
   if (input.side !== 'long' && input.side !== 'short') return 'side must be long or short'
-  const triggerPx = Number(input.triggerPx)
+  const kind = input.type === 'market' ? 'market' : 'limit'
+  // A market order's "trigger" is the mid when it was placed: it goes straight out, and fills are compared to it.
+  const triggerPx = kind === 'market' ? midPx : Number(input.triggerPx)
   if (!Number.isFinite(triggerPx) || triggerPx <= 0) return 'trigger price must be a positive number'
   if (Math.abs(triggerPx / midPx - 1) > 0.5) return 'trigger is more than 50% from the current price; check for a typo'
   // Margin is either a dollar amount (marginUsd) or a share of the free balance when it fires (marginPct).
@@ -117,12 +128,17 @@ export function newOrder(input: OrderInput, inst: Instrument | undefined, midPx:
   const leverage = Number(input.leverage)
   if (!Number.isInteger(leverage) || leverage < 1) return 'leverage must be a whole number of at least 1'
   if (leverage > inst.maxLeverage) return `leverage is above ${inst.symbol}'s max of ${inst.maxLeverage}x`
+  const minNotional = Math.max(MIN_NOTIONAL_USD, minNotionalUsd)
+  if (fixedMarginUsd !== undefined && fixedMarginUsd * leverage < minNotional) {
+    return `position size (margin × leverage) must be at least $${minNotional.toLocaleString('en-US')}`
+  }
   const expiresHours = Number(input.expiresHours ?? 24)
   if (!Number.isFinite(expiresHours) || expiresHours <= 0 || expiresHours > 24 * 30) return 'expiry must be between 0 and 30 days'
   const deadlineSec = Number(input.deadlineSec ?? 60)
   if (!Number.isInteger(deadlineSec) || deadlineSec < 15 || deadlineSec > 3600) return 'deadline must be 15–3600 seconds'
   return {
     id: randomUUID().slice(0, 8),
+    kind,
     wallet,
     symbol: inst.symbol,
     isLong: input.side === 'long',
@@ -132,7 +148,7 @@ export function newOrder(input: OrderInput, inst: Instrument | undefined, midPx:
     ...(fixedMarginUsd !== undefined ? { fixedMarginUsd } : {}),
     leverage,
     createdAt: now,
-    expiresAt: now + expiresHours * 3_600_000,
+    expiresAt: now + (kind === 'market' ? MARKET_EXPIRY_MS : expiresHours * 3_600_000),
     deadlineSec,
     status: 'armed',
     attempts: 0,
@@ -198,7 +214,7 @@ function saveOrders(orders: TriggerOrder[]): void {
 
 const short = (w: string) => `${w.slice(0, 6)}…${w.slice(-4)}`
 const describe = (o: TriggerOrder) =>
-  `${o.id} ${short(o.wallet)} ${o.isLong ? 'LONG' : 'SHORT'} ${o.symbol} ${o.when === 'below' ? '<=' : '>='} ${o.triggerPx} (${o.fixedMarginUsd !== undefined ? usd(o.fixedMarginUsd) : `${Math.round(o.marginPct * 100)}%`} at ${o.leverage}x)`
+  `${o.id} ${short(o.wallet)} ${o.isLong ? 'LONG' : 'SHORT'} ${o.symbol} ${o.kind === 'market' ? `MARKET (~${o.triggerPx})` : `${o.when === 'below' ? '<=' : '>='} ${o.triggerPx}`} (${o.fixedMarginUsd !== undefined ? usd(o.fixedMarginUsd) : `${Math.round(o.marginPct * 100)}%`} at ${o.leverage}x)`
 
 type FeeTx = { from: string; to: string | null; value: bigint; chainId?: number }
 /**
@@ -212,6 +228,12 @@ export function feePaymentProblem(tx: FeeTx, status: string, wallet: string, fee
   if (tx.to?.toLowerCase() !== feeAddress.toLowerCase()) return 'That transaction did not go to the fee wallet.'
   if (tx.value < minWei) return `That transaction sent less than ${formatEther(minWei)} HYPE.`
   return null
+}
+
+/** Transfers in a block that could pay the fee: straight to the fee address, for at least `minWei`. */
+export function feePayments<T extends { to: string | null; value: bigint }>(txs: T[], feeAddress: string, minWei: bigint): T[] {
+  const fee = feeAddress.toLowerCase()
+  return txs.filter((tx) => tx.to?.toLowerCase() === fee && tx.value >= minWei)
 }
 
 /** Friendly text for the relayer's refusals of a key registration. */
@@ -440,7 +462,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           o.note = 'waiting for a live price'
           continue
         }
-        if (!crossed(o, mid.px)) {
+        if (o.kind !== 'market' && !crossed(o, mid.px)) {
           if (o.note && !o.note.includes('re-armed')) o.note = undefined
           continue
         }
@@ -448,7 +470,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         if (Date.now() - tradingAt > TRADING_STALE_MS) hold = 'waiting for fresh market state'
         else if (tradingStatus(users.get(o.wallet)).status !== 'active') hold = 'trading key not active; enable trading again'
         else if (opts.live && !account(o.wallet).stream.state) hold = 'waiting for the account feed'
-        else hold = holdReason(o, inst, trading, mid.raw, freeUsd(o.wallet) - inFlightUsd(o.wallet), pub.pressure?.queuedIntents ?? null)
+        // Market orders go out like a normal trade, whatever the relayer queue; limits hold while it's backed up.
+        else hold = holdReason(o, inst, trading, mid.raw, freeUsd(o.wallet) - inFlightUsd(o.wallet), o.kind === 'market' ? null : pub.pressure?.queuedIntents ?? null)
         if (hold) {
           if (o.note !== `triggered; holding: ${hold}`) log('hold', `${describe(o)}: ${hold}`)
           o.note = `triggered; holding: ${hold}`
@@ -492,6 +515,46 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   // Claimable staking rewards come from PaperStaking itself (the feed's figure lags); read at most once a minute per wallet.
   const rewards = new Map<string, { usd: number | null; at: number; busy?: boolean }>()
   const client = makeClient()
+
+  // Fee watcher: while anyone who still owes the fee has the page open, read every new HyperEVM block and credit each
+  // successful transfer of at least the fee to the fee address to the wallet that sent it. A user just sends HYPE and
+  // trading unlocks on its own. It looks back a minute when it starts, and the unlock window can also check a hash.
+  const scanFile = join(STATE_DIR, 'fee-scan.json')
+  let scanned: number | null = existsSync(scanFile) ? Number(JSON.parse(readFileSync(scanFile, 'utf8')).block) : null
+  const someoneWaiting = () =>
+    [...accounts.values()].some((a) => Date.now() - a.usedAt < 10 * 60_000 && !feeOk(a.wallet))
+  const scanFees = async () => {
+    try {
+      if (!someoneWaiting()) scanned = null
+      else {
+        const head = Number(await client.getBlockNumber())
+        if (scanned === null || head - scanned > 1200) scanned = head - 60
+        const from = scanned + 1
+        const last = Math.min(head, scanned + FEE_SCAN_BATCH)
+        const blocks = await Promise.all(
+          Array.from({ length: Math.max(0, last - from + 1) }, (_, i) => client.getBlock({ blockNumber: BigInt(from + i), includeTransactions: true })),
+        )
+        for (const block of blocks) {
+          for (const tx of feePayments(block.transactions as { hash: Hex; from: Address; to: Address | null; value: bigint }[], FEE_ADDRESS!, FEE_WEI)) {
+            if (usedFeeTxs().has(tx.hash.toLowerCase()) || feeOk(tx.from)) continue
+            const receipt = await client.getTransactionReceipt({ hash: tx.hash })
+            if (receipt.status !== 'success') continue
+            const user = users.getOrCreate(tx.from)
+            user.fee = { tx: tx.hash.toLowerCase() as Hex, paidAt: Date.now(), wei: String(tx.value) }
+            users.save()
+            log('fee', `${short(user.wallet)} paid ${formatEther(tx.value)} HYPE in block ${block.number} (${tx.hash.slice(0, 10)}); trading unlocked`)
+          }
+        }
+        scanned = last
+        mkdirSync(STATE_DIR, { recursive: true })
+        writeFileSync(scanFile, JSON.stringify({ block: scanned }))
+      }
+    } catch (err) {
+      log('warn', `fee scan: ${errMsg(err)}`)
+    }
+    setTimeout(scanFees, FEE_SCAN_MS)
+  }
+  if (FEE_ADDRESS) void scanFees()
   const pendingRewardUsd = (wallet: Address) => {
     const r = rewards.get(wallet) ?? { usd: null, at: 0 }
     rewards.set(wallet, r)
@@ -595,14 +658,15 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   })
 
   const candles = new CandleStore()
-  // paperwatch.app is this one server: Limit Intents at /limits, the queue page at /queue (also /que), shared top bar.
+  // paperwatch.app is this one server: Trade at /trade (also /limits), the queue page at /queue (also /que), shared top bar.
   const queue = startQueueRelay()
   createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://x')
     baseHeaders(res)
     if (req.method === 'GET') {
-      if (url.pathname === '/') return void res.writeHead(302, { location: '/limits' }).end()
-      if (url.pathname === '/limits' || url.pathname === '/limits/') return servePage(res, 'trigger.html')
+      if (url.pathname === '/') return void res.writeHead(302, { location: '/trade' }).end()
+      // /trade is the page; /limits (its old name) still works.
+      if (['/trade', '/trade/', '/limits', '/limits/'].includes(url.pathname)) return servePage(res, 'trigger.html')
       if (url.pathname === '/vendor/lightweight-charts.js') return serveChartJs(res)
       if (url.pathname.startsWith('/assets/') && serveAsset(res, url.pathname.slice(8))) return
       if (['/queue', '/queue/', '/que', '/que/'].includes(url.pathname)) return queue.page(res)
@@ -770,7 +834,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         const inst = instOf(String(input.symbol ?? ''))
         const mid = inst && midPx(inst)
         if (inst && !mid) return json(res, 400, { error: 'no live price yet; try again in a few seconds' })
-        const o = newOrder(input, inst, mid?.px ?? 0, Date.now(), wallet!)
+        const o = newOrder(input, inst, mid?.px ?? 0, Date.now(), wallet!, Number(trading.minimumOpenNotionalRaw) / 1e18)
         if (typeof o === 'string') return json(res, 400, { error: o })
         orders.push(o)
         persist()

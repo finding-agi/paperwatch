@@ -1,4 +1,4 @@
-// Shared top bar for the Paperwatch pages: logo, the Limit Intents (trigger) and Queue links, and the wallet button.
+// Shared top bar for the Paperwatch pages: logo, the Trade (trigger) and Queue links, and the wallet button.
 // Each page loads it with <script src="/site.js"></script> and names itself with <body data-page="queue|trigger">. The
 // server fills in the two page URLs: /limits and /queue on paperwatch.app, where one server serves both.
 //
@@ -8,7 +8,7 @@
 // through window.paperwatchWallet and the 'paperwatch:wallet' event.
 ;(() => {
   const PAGES = [
-    { id: 'trigger', label: 'Limit Intents', url: '__TRIGGER_URL__' },
+    { id: 'trigger', label: 'Trade', url: '__TRIGGER_URL__' },
     { id: 'queue', label: 'Queue', url: '__QUEUE_URL__' },
   ]
   const HYPEREVM = {
@@ -35,9 +35,10 @@
   .site-logo { display: flex; align-items: center; flex: none; }
   .site-logo img { height: 30px; width: auto; display: block; }
   .site-nav { display: flex; gap: 4px; flex: 1; min-width: 0; }
-  .site-nav a { padding: 6px 12px; border-radius: 3px; color: rgba(225, 195, 187, 0.75); text-decoration: none; font-size: 15px; font-weight: 600; white-space: nowrap; }
-  .site-nav a:hover { color: #fff; background: rgba(225, 195, 187, 0.08); }
-  .site-nav a.on { color: #fff; background: rgba(225, 195, 187, 0.14); }
+  .site-nav a { padding: 5px 12px; border-radius: 3px; border: 1px solid transparent; color: rgba(225, 195, 187, 0.8); text-decoration: none; font-size: 15px; font-weight: 600; white-space: nowrap; }
+  .site-nav a:hover { color: #fff; border-color: rgba(240, 79, 36, 0.55); }
+  /* The current page: widget tan with the orange outline. */
+  .site-nav a.on { color: #211b14; background: #f4eedb; border-color: #f04f24; }
   .site-nav a.off { opacity: 0.45; pointer-events: none; }
   .site-stats { display: flex; gap: 18px; align-items: center; flex: none; }
   .site-stats:empty { display: none; }
