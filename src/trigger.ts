@@ -511,14 +511,30 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   const accountBox = (wallet: Address) => {
     const s = accounts.get(wallet)?.stream.state
     if (!s) return null
+    // Each open position at the live mid; PnL is before the win haircut Papertrade takes on close.
     let openPnlUsd = 0
-    for (const p of s.positions.values()) {
+    const open = [...s.positions.values()].map((p) => {
       const inst = trading.instruments.find((i) => i.id === p.instrumentId)
-      const mid = inst && midPx(inst)
-      if (!inst || !mid) continue
-      const entry = Number(p.entryPriceRaw) / Number(inst.priceScale)
-      openPnlUsd += (Number(p.marginRaw) / 1e18) * p.leverage * ((mid.px - entry) / entry) * (p.isLong ? 1 : -1)
-    }
+      const mid = inst ? midPx(inst) : null
+      const scale = Number(inst?.priceScale ?? 1)
+      const entryPx = Number(p.entryPriceRaw) / scale
+      const marginUsd = Number(p.marginRaw) / 1e18
+      const pnlUsd = mid ? marginUsd * p.leverage * ((mid.px - entryPx) / entryPx) * (p.isLong ? 1 : -1) : null
+      if (pnlUsd != null) openPnlUsd += pnlUsd
+      return {
+        id: p.positionId,
+        symbol: inst?.symbol ?? `#${p.instrumentId}`,
+        isLong: p.isLong,
+        marginUsd,
+        leverage: p.leverage,
+        sizeUsd: marginUsd * p.leverage,
+        entryPx,
+        markPx: mid?.px ?? null,
+        bustPx: Number(p.bustPriceRaw) / scale,
+        pnlUsd,
+        openedAt: p.openedAtMs,
+      }
+    })
     const usdOf = (raw: bigint) => Number(raw) / 1e18
     const balanceUsd = usdOf(s.balance)
     const l = s.lifetime
@@ -530,6 +546,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       openPnlUsd,
       queuedUsd: usdOf(s.queued), // winnings waiting in the LP payout queue
       positions: s.positions.size,
+      open: open.sort((a, b) => b.openedAt - a.openedAt),
       paper: { wallet: usdOf(s.paperBalance), staked: usdOf(s.paperStaked), rewardsUsd: pendingRewardUsd(wallet) },
       lifetime: l && {
         feesPaidUsd: usdOf(l.feesPaidRaw),

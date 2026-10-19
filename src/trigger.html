@@ -150,12 +150,12 @@
       </div>
 
       <div class="card orders-card">
-        <div class="tabs" id="tabs"><button data-v="open" class="on">Open <span id="open-count"></span></button><button data-v="history">History</button></div>
+        <div class="tabs" id="tabs"><button data-v="open" class="on">Open <span id="pos-count"></span></button><button data-v="orders">Orders <span id="open-count"></span></button><button data-v="history">History</button></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>Side</th><th>Market</th><th class="r">Trigger</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th>Status</th><th class="hide-sm">Detail</th><th></th></tr></thead>
+          <thead id="orders-head"></thead>
           <tbody id="orders"></tbody>
         </table></div>
-        <div class="muted" id="orders-empty" style="padding: 12px 8px 2px;">No open limit intents.</div>
+        <div class="muted" id="orders-empty" style="padding: 12px 8px 2px;"></div>
       </div>
       <div class="credit">Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView</a> Lightweight Charts™</div>
     </div>
@@ -439,14 +439,40 @@ function renderAccount() {
   $('queue').textContent = state.queued == null ? '—' : `${state.queued}${state.queued >= state.maxQueued ? ' ⚠' : ''}`
 }
 
+// Open: the account's live Papertrade positions (any source). Orders: limit intents still waiting or in flight.
+// History: finished limit intents.
+const ORDER_HEAD = '<tr><th>Side</th><th>Market</th><th class="r">Trigger</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th>Status</th><th class="hide-sm">Detail</th><th></th></tr>'
+const POSITION_HEAD = '<tr><th>Side</th><th>Market</th><th class="r">Size</th><th class="r">Margin</th><th class="r hide-sm">Lev</th><th class="r">Entry</th><th class="r hide-sm">Mark</th><th class="r hide-sm">Bust</th><th class="r">PnL</th></tr>'
+
+function renderPositions(list) {
+  $('orders-head').innerHTML = POSITION_HEAD
+  $('orders-empty').hidden = list.length > 0
+  $('orders-empty').textContent = state.view ? 'No open positions.' : 'Connect a wallet to see its positions.'
+  $('orders').innerHTML = list.map((p) => `<tr>
+      <td class="${p.isLong ? 'up' : 'down'}"><b>${p.isLong ? 'Long' : 'Short'}</b></td>
+      <td>${esc(p.symbol)}</td>
+      <td class="r">${money(p.sizeUsd, 0)}</td>
+      <td class="r">${money(p.marginUsd)}</td>
+      <td class="r hide-sm">${esc(p.leverage)}×</td>
+      <td class="r">${px(p.entryPx)}</td>
+      <td class="r hide-sm">${px(p.markPx)}</td>
+      <td class="r hide-sm">${px(p.bustPx)}</td>
+      <td class="r ${p.pnlUsd == null ? '' : p.pnlUsd >= 0 ? 'up' : 'down'}">${p.pnlUsd == null ? '—' : (p.pnlUsd >= 0 ? '+' : '') + money(p.pnlUsd)}</td>
+    </tr>`).join('')
+}
+
 function renderOrders() {
   const now = Date.now()
+  const positions = state.account?.open ?? []
   const open = state.orders.filter((o) => o.status === 'armed' || o.status === 'sending' || o.status === 'sent')
-  const list = form.tab === 'open' ? open : state.orders.filter((o) => !open.includes(o))
+  $('pos-count').textContent = positions.length ? `(${positions.length})` : ''
   $('open-count').textContent = open.length ? `(${open.length})` : ''
   for (const b of $('tabs').children) b.classList.toggle('on', b.dataset.v === form.tab)
+  if (form.tab === 'open') return renderPositions(positions)
+  const list = form.tab === 'orders' ? open : state.orders.filter((o) => !open.includes(o))
+  $('orders-head').innerHTML = ORDER_HEAD
   $('orders-empty').hidden = list.length > 0
-  $('orders-empty').textContent = form.tab === 'open' ? 'No open limit intents.' : 'No history yet.'
+  $('orders-empty').textContent = form.tab === 'orders' ? 'No open limit intents.' : 'No history yet.'
   $('orders').innerHTML = list.map((o) => {
     let detail = o.status === 'armed' ? `expires in ${ago(o.expiresAt - now)}` : `placed ${ago(now - o.createdAt)} ago`
     if (o.fill) detail = `filled @ ${px(o.fill.entryPx)} after ${o.fill.waitedS}s`
@@ -594,7 +620,7 @@ $('place').onclick = async () => {
   const body = { symbol: form.symbol, side: form.side, triggerPx: Number($('trigger').value), marginUsd: Number($('margin').value),
     leverage: Number($('lev-in').value), expiresHours: Number($('expires').value), deadlineSec: Number($('deadline').value) }
   $('place').disabled = true
-  try { await api('/api/orders', body); form.touched = false; form.tab = 'open'; poll() } catch (err) { showError(err.message) } finally { $('place').disabled = false }
+  try { await api('/api/orders', body); form.touched = false; form.tab = 'orders'; poll() } catch (err) { showError(err.message) } finally { $('place').disabled = false }
 }
 
 hlConnect()
