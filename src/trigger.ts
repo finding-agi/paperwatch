@@ -1,12 +1,10 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { join } from 'node:path'
 import { encodeFunctionData, formatEther, getAddress, parseEther, verifyMessage, zeroAddress, type Address, type Hex } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { AccountStream } from './account.ts'
 import { RelayerError, getTradingState, submitIntent, type Instrument, type TradingState } from './api.ts'
-import { CONTRACTS, INTENT_TTL_SEC, SESSION_TTL_SEC, STATE_DIR, USDC_UNIT } from './config.ts'
+import { CONTRACTS, INTENT_TTL_SEC, SESSION_TTL_SEC, USDC_UNIT } from './config.ts'
 import { EXCHANGE_DOMAIN, deadlineFromNow, intentFromSignature, signIntent, walletTypedData } from './eip712.ts'
 import { PublicStream } from './intake.ts'
 import { toPriceRaw } from './market.ts'
@@ -14,9 +12,9 @@ import { sideHeadroomUsd } from './risk.ts'
 import { baseHeaders, serveAsset, serveChartJs, servePage, serveSiteJs } from './site.ts'
 import { startQueueRelay } from './queue-viz.ts'
 import { CandleStore } from './candles.ts'
-import { Db } from './db.ts'
-import { NonceSource } from './state.ts'
-import { UserStore, issueToken, openKey, readToken, sealKey, signInMessage, type UserRecord } from './users.ts'
+import { Store } from './db.ts'
+import { NONCE_ABI } from './state.ts'
+import { issueToken, openKey, readToken, sealKey, signInMessage, type UserRecord } from './users.ts'
 import { log, makeClient, usd } from './bot.ts'
 
 // Limit Intents (its own Railway service, PT_PROCESS=trigger), a public page where anyone can place orders like "long
@@ -28,8 +26,8 @@ import { log, makeClient, usd } from './bot.ts'
 //   mid crosses the trigger. It is NOT a limit order: the intent has no price field, so the fill is the mid when the
 //   relayer lands it, which in a backed-up queue can be well past the trigger. Each sent intent carries a short
 //   deadline, so a stale one expires instead of filling late. An order holds while the relayer queue is backed up.
-// Opens only: it never closes anything. PT_MODE=live sends for real; dry signs nothing and only logs. State lives in
-// <state dir>: trigger-orders.json, users.json (sealed keys) and candles/.
+// PT_MODE=live sends for real; dry signs nothing and only logs. State (wallets, sealed keys, orders) lives in Postgres
+// (src/db.ts); <state dir> keeps only the candle cache, plus the local database when there is no DATABASE_URL.
 
 const PORT = Number(process.env.PORT ?? process.env.PT_TRIGGER_PORT ?? 8788)
 const PUBLIC = Boolean(process.env.PORT) // Railway sets PORT; locally the page stays on localhost
@@ -60,8 +58,8 @@ const FEE_EXEMPT = new Set((process.env.PT_FEE_EXEMPT ?? '').split(',').map((w) 
 const FEE_CHECK_MS = 3000 // one /api/fee/confirm per wallet this often; each check is two RPC reads
 const REVOKE_ABI = [{ type: 'function', name: 'revokeSessionKey', stateMutability: 'nonpayable', inputs: [{ type: 'address' }], outputs: [] }] as const
 const FILL_GRACE_MS = 120_000 // after the intent's deadline, how long to keep looking for its position
-const KEEP_DONE = 50 // finished orders kept for the page
-const ORDERS_FILE = () => join(STATE_DIR, 'trigger-orders.json')
+const REFRESH_MS = 1000 // how often the replica pulls changed rows from the database
+const PRUNE_MS = 3_600_000 // how often finished orders past the newest 50 per wallet are deleted
 const errMsg = (err: unknown) => (err instanceof Error ? err.message.split('\n')[0] : String(err))
 
 export type OrderStatus = 'armed' | 'sending' | 'sent' | 'filled' | 'failed' | 'cancelled' | 'expired' | 'unconfirmed'
@@ -194,26 +192,6 @@ export function holdReason(
   return null
 }
 
-/** Orders from the database when it has any, else from trigger-orders.json (the first run copies them in). */
-async function loadOrders(db: Db | null): Promise<TriggerOrder[]> {
-  const rows = db ? [...(await db.load<TriggerOrder>('orders')).values()].sort((a, b) => a.createdAt - b.createdAt) : []
-  const orders = rows.length ? rows : existsSync(ORDERS_FILE()) ? (JSON.parse(readFileSync(ORDERS_FILE(), 'utf8')) as TriggerOrder[]) : []
-  // A restart mid-send can't tell whether the intent reached the relayer: never send those again.
-  for (const o of orders) {
-    if (!o.wallet && o.status === 'armed') Object.assign(o, { status: 'cancelled', note: 'placed before wallet accounts; place it again' })
-    if (o.status === 'sending') Object.assign(o, { status: 'unconfirmed', note: 'restarted while sending; check the app before placing it again' })
-  }
-  return orders
-}
-
-function saveOrders(orders: TriggerOrder[], db: Db | null): void {
-  mkdirSync(STATE_DIR, { recursive: true })
-  const tmp = `${ORDERS_FILE()}.tmp`
-  writeFileSync(tmp, JSON.stringify(orders, null, 2))
-  renameSync(tmp, ORDERS_FILE())
-  db?.sync('orders', orders.map((o) => [o.id, o]))
-}
-
 const short = (w: string) => `${w.slice(0, 6)}…${w.slice(-4)}`
 const describe = (o: TriggerOrder) =>
   `${o.id} ${short(o.wallet)} ${o.isLong ? 'LONG' : 'SHORT'} ${o.symbol} ${o.kind === 'market' ? `MARKET (~${o.triggerPx})` : `${o.when === 'below' ? '<=' : '>='} ${o.triggerPx}`} (${o.fixedMarginUsd !== undefined ? usd(o.fixedMarginUsd) : `${Math.round(o.marginPct * 100)}%`} at ${o.leverage}x)`
@@ -255,21 +233,32 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   if (authSecret.length < 32) throw new Error('set PT_AUTH_SECRET to a random string of 32+ characters (signs sign-in cookies)')
   const keySecret = process.env.PT_KEY_SECRET || (PUBLIC || opts.live ? '' : 'local-dry-run-only-not-a-real-secret')
   if (keySecret.length < 32) throw new Error('set PT_KEY_SECRET to a random string of 32+ characters (encrypts trading keys at rest)')
-  // Postgres (DATABASE_URL) holds users, orders and the activity log; the JSON files on the volume stay as a fallback copy.
-  const db = Db.fromEnv()
-  if (db) await db.init()
-  const users = await UserStore.open(db)
-  const track = (type: string, wallet: string | null, data: Record<string, unknown> = {}) => db?.event(type, wallet, data)
-  // Before anything goes to the relayer, every save so far must be in the database, so a restart can't send it twice.
-  const dbReady = async () => {
-    try {
-      await db?.flush()
-      return true
-    } catch (err) {
-      log('warn', errMsg(err))
-      return false
-    }
+  // Postgres holds wallets, orders, sign-ins, closes and the activity log; reads come from the store's replica.
+  const store = await Store.open(PUBLIC)
+  const users = { get: (wallet: string) => store.users.get(wallet.toLowerCase()) }
+  const allOrders = () => [...store.orders.values()]
+  const track = (type: string, wallet: string | null, data: Record<string, unknown> = {}) => store.event(type, wallet, data)
+  const client = makeClient()
+  // A restart can't tell whether an order being sent reached the relayer: never send those again.
+  for (const o of allOrders()) {
+    if (!o.wallet && o.status === 'armed') await store.transition(o.id, ['armed'], { status: 'cancelled', note: 'placed before wallet accounts; place it again' })
+    if (o.status === 'sending') await store.transition(o.id, ['sending'], { status: 'unconfirmed', note: 'restarted while sending; check the app before placing it again' })
   }
+  let refreshing = false
+  let refreshWarned = 0
+  setInterval(() => {
+    if (refreshing) return
+    refreshing = true
+    store
+      .refresh()
+      .catch((err) => {
+        if (Date.now() - refreshWarned < 60_000) return
+        refreshWarned = Date.now()
+        log('warn', `database refresh: ${errMsg(err)}`)
+      })
+      .finally(() => (refreshing = false))
+  }, REFRESH_MS)
+  setInterval(() => void store.pruneOrders().catch((err) => log('warn', `prune orders: ${errMsg(err)}`)), PRUNE_MS)
 
   let trading = await getTradingState()
   let tradingAt = Date.now()
@@ -316,18 +305,6 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   const pub = new PublicStream()
   pub.start()
 
-  let orders = await loadOrders(db)
-  const persist = () => {
-    const done = orders.filter((o) => o.status !== 'armed' && o.status !== 'sending' && o.status !== 'sent')
-    const keep = KEEP_DONE * Math.max(1, new Set(orders.map((o) => o.wallet)).size)
-    if (done.length > keep) {
-      const drop = new Set(done.sort((a, b) => a.createdAt - b.createdAt).slice(0, done.length - keep))
-      orders = orders.filter((o) => !drop.has(o))
-    }
-    saveOrders(orders, db)
-  }
-  if (db) persist() // the first run with a database copies trigger-orders.json in; restart fixes are saved too
-
   // ---- accounts: one read-only Papertrade account feed per wallet in use ----------------------------------------------
   const accounts = new Map<string, Account>()
   const account = (wallet: Address): Account => {
@@ -347,10 +324,10 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     a.usedAt = Date.now()
     return a
   }
-  for (const o of orders) if (o.status === 'armed' || o.status === 'sent') account(o.wallet)
+  for (const o of allOrders()) if (o.status === 'armed' || o.status === 'sent') account(o.wallet)
   setInterval(() => {
     for (const [id, a] of accounts) {
-      const busy = orders.some((o) => o.wallet === id && (o.status === 'armed' || o.status === 'sending' || o.status === 'sent'))
+      const busy = allOrders().some((o) => o.wallet === id && (o.status === 'armed' || o.status === 'sending' || o.status === 'sent'))
       if (!busy && Date.now() - a.usedAt > IDLE_STREAM_MS) {
         a.stream.stop()
         accounts.delete(id)
@@ -365,7 +342,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   }
   // Margin already committed by this wallet's sent-but-unfilled orders, so two orders can't both spend it.
   const inFlightUsd = (wallet: Address) =>
-    orders.filter((o) => o.wallet === wallet && (o.status === 'sending' || o.status === 'sent')).reduce((s, o) => s + (o.marginUsd ?? 0), 0)
+    allOrders().filter((o) => o.wallet === wallet && (o.status === 'sending' || o.status === 'sent')).reduce((s, o) => s + (o.marginUsd ?? 0), 0)
 
   /** Whether the wallet's trading key is usable, from the account feed (dry runs skip the on-chain part). */
   const tradingStatus = (user: UserRecord | undefined) => {
@@ -381,22 +358,33 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
 
   const feeOk = (wallet: Address) => !FEE_ADDRESS || FEE_EXEMPT.has(wallet.toLowerCase()) || Boolean(users.get(wallet)?.fee)
   const feeChecks = new Map<Address, number>() // last /api/fee/confirm per wallet
-  const usedFeeTxs = () => new Set(users.all().flatMap((u) => (u.fee ? [u.fee.tx.toLowerCase()] : [])))
   const feeInfo = (wallet: Address | null) =>
     FEE_ADDRESS && { address: FEE_ADDRESS, hype: formatEther(FEE_WEI), valueHex: `0x${FEE_WEI.toString(16)}`, required: wallet ? !feeOk(wallet) : true }
 
-  const nonceSource = (user: UserRecord) => {
-    const holder = { nextNonce: BigInt(user.nextNonce) }
-    return new NonceSource(holder, () => {
-      user.nextNonce = String(holder.nextNonce)
-      users.save()
-    })
+  // The wallet's next intent nonce from the database counter. The first one this process uses for a wallet is checked
+  // on-chain too (a counter restored from an old copy); a used one jumps to a fresh random range.
+  const nextNonce = async (wallet: Address, a: Account) => {
+    for (let i = 0; i < 64; i++) {
+      const n = await store.takeNonce(wallet)
+      if (a.noncesChecked) return n
+      const used = await client.readContract({ address: CONTRACTS.sessionKeyManager, abi: NONCE_ABI, functionName: 'isNonceUsed', args: [wallet, n] })
+      if (!used) {
+        a.noncesChecked = true
+        return n
+      }
+      await store.jumpNonce(wallet)
+    }
+    throw new Error('could not find an unused nonce')
   }
 
-  const settle = (o: TriggerOrder, update: Partial<TriggerOrder>, line: string) => {
+  /** Move an order on, only from one of the statuses in `from`; null (and nothing changes) if it had already moved. */
+  const settle = async (o: TriggerOrder, from: OrderStatus[], update: Partial<TriggerOrder>, line: string) => {
     const was = o.status
-    Object.assign(o, update)
-    persist()
+    const next = await store.transition(o.id, from, update)
+    if (!next) {
+      log('trig', `${describe(o)}: ${line}; skipped, the order is ${store.orders.get(o.id)?.status ?? 'gone'}`)
+      return null
+    }
     if (o.status !== was) {
       track(`order_${o.status}`, o.wallet, {
         id: o.id, symbol: o.symbol, side: o.isLong ? 'long' : 'short', kind: o.kind ?? 'limit', leverage: o.leverage,
@@ -404,11 +392,19 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       })
     }
     log(update.status === 'filled' ? 'FILL' : 'trig', `${describe(o)}: ${line}`)
+    return next
   }
 
-  const rearmOrFail = (o: TriggerOrder, why: string) => {
-    if (o.attempts < MAX_ATTEMPTS && Date.now() < o.expiresAt) settle(o, { status: 'armed', note: `${why}; re-armed (attempt ${o.attempts}/${MAX_ATTEMPTS})` }, `${why}; re-armed`)
-    else settle(o, { status: 'failed', note: why }, `${why}; giving up`)
+  const rearmOrFail = (o: TriggerOrder, from: OrderStatus[], why: string) =>
+    o.attempts < MAX_ATTEMPTS && Date.now() < o.expiresAt
+      ? settle(o, from, { status: 'armed', note: `${why}; re-armed (attempt ${o.attempts}/${MAX_ATTEMPTS})` }, `${why}; re-armed`)
+      : settle(o, from, { status: 'failed', note: why }, `${why}; giving up`)
+
+  /** A display note on an armed order (why it's holding), written only when it changes. */
+  const noteArmed = (o: TriggerOrder, note: string | undefined) => {
+    if (o.note === note) return
+    o.note = note
+    void store.transition(o.id, ['armed'], { note }).catch((err) => log('warn', `${describe(o)}: note: ${errMsg(err)}`))
   }
 
   const waitForFill = (a: Account, intentId: Hex, timeoutMs: number) =>
@@ -425,76 +421,74 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     const user = users.get(o.wallet)
     const size = sizeOrder(o, freeUsd(o.wallet) - inFlightUsd(o.wallet), inst, trading)
     if (typeof size === 'string' || !user?.key) return
-    o.attempts++
     if (!opts.live) {
-      settle(o, { status: 'filled', firedPx: mid.px, marginUsd: size.marginUsd, sentAt: Date.now(), note: 'dry run: nothing sent', fill: { positionId: 'dry', entryPx: mid.px, waitedS: 0 } },
+      await settle(o, ['armed'], { status: 'filled', attempts: o.attempts + 1, firedPx: mid.px, marginUsd: size.marginUsd, sentAt: Date.now(), note: 'dry run: nothing sent', fill: { positionId: 'dry', entryPx: mid.px, waitedS: 0 } },
         `dry: would open ${usd(size.notionalUsd, 0)} (${usd(size.marginUsd)} margin) at ~${mid.px}; nothing sent`)
       return
     }
-    // Saved as 'sending' before the request, so a crash here can never lead to a second send.
-    settle(o, { status: 'sending', firedPx: mid.px, marginUsd: size.marginUsd, sentAt: Date.now(), note: undefined }, `FIRE at ${mid.px}: ${usd(size.notionalUsd, 0)} (${usd(size.marginUsd)} margin), queue ${pub.pressure?.queuedIntents ?? '?'}`)
-    let intentId: Hex
+    // Claimed as 'sending' in the database before anything is signed: only one claim can win, and a crash after it
+    // leaves the order 'sending' (then 'unconfirmed' on restart), never armed again, so it is never sent twice.
+    const claimed = await settle(o, ['armed'], { status: 'sending', attempts: o.attempts + 1, firedPx: mid.px, marginUsd: size.marginUsd, sentAt: Date.now(), note: undefined },
+      `FIRE at ${mid.px}: ${usd(size.notionalUsd, 0)} (${usd(size.marginUsd)} margin), queue ${pub.pressure?.queuedIntents ?? '?'}`)
+    if (!claimed) return
+    let signed: Awaited<ReturnType<typeof signIntent>>
     try {
-      const nonces = nonceSource(user)
-      if (!a.noncesChecked) {
-        await nonces.ensureUnused(makeClient(), o.wallet)
-        a.noncesChecked = true
-      }
-      const signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'OpenPosition', {
+      signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'OpenPosition', {
         user: o.wallet,
         instrumentId: inst.id,
         isLong: o.isLong,
         size: size.marginRaw,
         leverage: o.leverage,
         useDebt: false,
-        nonce: nonces.take(),
+        nonce: await nextNonce(o.wallet, a),
         deadline: deadlineFromNow(BigInt(o.deadlineSec)),
       })
-      intentId = signed.intentId
-      o.intentId = intentId
-      persist()
-      if (!(await dbReady())) {
-        o.attempts--
-        settle(o, { status: 'armed', intentId: undefined, note: 'waiting for the database; re-armed' }, 'database behind; not sent')
-        return
-      }
+      await store.transition(o.id, ['sending'], { intentId: signed.intentId })
+    } catch (err) {
+      // Nothing went to the relayer: put it back (if the database is down too, it stays 'sending' and is never sent).
+      await settle(o, ['sending'], { status: 'armed', attempts: o.attempts - 1, intentId: undefined, note: `not sent (${errMsg(err)}); re-armed` }, `not sent: ${errMsg(err)}`).catch(() => {})
+      return
+    }
+    const intentId = signed.intentId
+    try {
       await submitIntent('openPosition', signed.signed, intentId)
     } catch (err) {
       // A relayer refusal means nothing is queued; anything else (timeout, network) might have reached it.
-      if (err instanceof RelayerError) rearmOrFail(o, `rejected: ${errMsg(err)}`)
-      else settle(o, { status: 'unconfirmed', note: `send failed (${errMsg(err)}); it may still fill, check Papertrade` }, `send failed: ${errMsg(err)}`)
+      if (err instanceof RelayerError) await rearmOrFail(o, ['sending'], `rejected: ${errMsg(err)}`)
+      else await settle(o, ['sending'], { status: 'unconfirmed', note: `send failed (${errMsg(err)}); it may still fill, check Papertrade` }, `send failed: ${errMsg(err)}`)
       return
     }
-    settle(o, { status: 'sent' }, `sent ${intentId.slice(0, 10)}, deadline ${o.deadlineSec}s`)
+    await settle(o, ['sending'], { status: 'sent' }, `sent ${intentId.slice(0, 10)}, deadline ${o.deadlineSec}s`)
     const pos = await waitForFill(a, intentId, o.deadlineSec * 1000 + FILL_GRACE_MS)
     if (pos) {
       const entryPx = Number(pos.entryPriceRaw) / Number(inst.priceScale)
       const waitedS = Math.round((pos.openedAtMs - o.sentAt!) / 1000)
       const slipBp = ((entryPx - o.triggerPx) / o.triggerPx) * 1e4 * (o.isLong ? 1 : -1)
-      settle(o, { status: 'filled', fill: { positionId: pos.positionId, entryPx, waitedS }, note: `${slipBp >= 0 ? 'worse' : 'better'} than trigger by ${Math.abs(slipBp).toFixed(1)}bp` },
+      await settle(o, ['sent'], { status: 'filled', fill: { positionId: pos.positionId, entryPx, waitedS }, note: `${slipBp >= 0 ? 'worse' : 'better'} than trigger by ${Math.abs(slipBp).toFixed(1)}bp` },
         `#${pos.positionId} @ ${entryPx} after ${waitedS}s (trigger ${o.triggerPx}, sent at ${o.firedPx}, ${slipBp.toFixed(1)}bp vs trigger)`)
-    } else if (a.failed.has(intentId)) rearmOrFail(o, 'intent expired or failed before filling')
-    else settle(o, { status: 'unconfirmed', note: 'no fill seen; it may still land, check Papertrade' }, 'no fill or failure seen')
+    } else if (a.failed.has(intentId)) await rearmOrFail(o, ['sent'], 'intent expired or failed before filling')
+    else await settle(o, ['sent'], { status: 'unconfirmed', note: 'no fill seen; it may still land, check Papertrade' }, 'no fill or failure seen')
   }
 
   // One check a second: expire old orders, fire at most one triggered order per pass.
   let busy = false
+  const firing = new Set<string>() // orders this process is sending, so the next pass doesn't try to claim them again
   const check = async () => {
     if (busy) return
     busy = true
     try {
-      for (const o of orders) {
-        if (o.status === 'armed' && Date.now() > o.expiresAt) settle(o, { status: 'expired', note: 'expired before triggering' }, 'expired')
+      for (const o of allOrders()) {
+        if (o.status === 'armed' && Date.now() > o.expiresAt) await settle(o, ['armed'], { status: 'expired', note: 'expired before triggering' }, 'expired')
       }
-      for (const o of orders.filter((o) => o.status === 'armed')) {
+      for (const o of allOrders().filter((o) => o.status === 'armed' && !firing.has(o.id))) {
         const inst = instOf(o.symbol)
         const mid = inst && midPx(inst)
         if (!inst || !mid) {
-          o.note = 'waiting for a live price'
+          noteArmed(o, 'waiting for a live price')
           continue
         }
         if (o.kind !== 'market' && !crossed(o, mid.px)) {
-          if (o.note && !o.note.includes('re-armed')) o.note = undefined
+          if (o.note && !o.note.includes('re-armed')) noteArmed(o, undefined)
           continue
         }
         let hold: string | null = null
@@ -505,17 +499,20 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         else hold = holdReason(o, inst, trading, mid.raw, freeUsd(o.wallet) - inFlightUsd(o.wallet), o.kind === 'market' ? null : pub.pressure?.queuedIntents ?? null)
         if (hold) {
           if (o.note !== `triggered; holding: ${hold}`) log('hold', `${describe(o)}: ${hold}`)
-          o.note = `triggered; holding: ${hold}`
+          noteArmed(o, `triggered; holding: ${hold}`)
           continue
         }
-        void fire(o, inst, mid).catch((err) => log('warn', `${describe(o)}: ${errMsg(err)}`))
+        firing.add(o.id)
+        void fire(o, inst, mid)
+          .catch((err) => log('warn', `${describe(o)}: ${errMsg(err)}`))
+          .finally(() => firing.delete(o.id))
         break
       }
     } finally {
       busy = false
     }
   }
-  setInterval(() => void check(), CHECK_MS)
+  setInterval(() => void check().catch((err) => log('warn', `check: ${errMsg(err)}`)), CHECK_MS)
 
   // ---- HTTP ------------------------------------------------------------------------------------------------------------
   const json = (res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) =>
@@ -540,16 +537,12 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     String(req.headers.cookie ?? '').split(/;\s*/).find((c) => c.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1)
   const sessionCookie = (value: string, maxAgeSec: number) =>
     `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${PUBLIC ? '; Secure' : ''}`
-  const signIns = new Map<string, { message: string; at: number }>() // wallet -> pending sign-in message
   const isAddress = (v: unknown): v is Address => typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v)
-
-  const client = makeClient()
 
   // Fee watcher: while anyone who still owes the fee has the page open, read every new HyperEVM block and credit each
   // successful transfer of at least the fee to the fee address to the wallet that sent it. A user just sends HYPE and
   // trading unlocks on its own. It looks back a minute when it starts, and the unlock window can also check a hash.
-  const scanFile = join(STATE_DIR, 'fee-scan.json')
-  const scanSaved = (await db?.get<{ block: number }>('fee-scan')) ?? (existsSync(scanFile) ? JSON.parse(readFileSync(scanFile, 'utf8')) : null)
+  const scanSaved = await store.get<{ block: number }>('fee-scan')
   let scanned: number | null = scanSaved ? Number(scanSaved.block) : null
   const someoneWaiting = () =>
     [...accounts.values()].some((a) => Date.now() - a.usedAt < 10 * 60_000 && !feeOk(a.wallet))
@@ -566,20 +559,16 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         )
         for (const block of blocks) {
           for (const tx of feePayments(block.transactions as { hash: Hex; from: Address; to: Address | null; value: bigint }[], FEE_ADDRESS!, FEE_WEI)) {
-            if (usedFeeTxs().has(tx.hash.toLowerCase()) || feeOk(tx.from)) continue
+            if (store.isFeeTxUsed(tx.hash) || feeOk(tx.from)) continue
             const receipt = await client.getTransactionReceipt({ hash: tx.hash })
             if (receipt.status !== 'success') continue
-            const user = users.getOrCreate(tx.from)
-            user.fee = { tx: tx.hash.toLowerCase() as Hex, paidAt: Date.now(), wei: String(tx.value) }
-            users.save()
-            track('fee_paid', user.wallet, { tx: tx.hash, wei: String(tx.value), via: 'scan' })
-            log('fee', `${short(user.wallet)} paid ${formatEther(tx.value)} HYPE in block ${block.number} (${tx.hash.slice(0, 10)}); trading unlocked`)
+            if (!(await store.setFee(tx.from, { tx: tx.hash.toLowerCase() as Hex, paidAt: Date.now(), wei: String(tx.value) }))) continue
+            track('fee_paid', tx.from, { tx: tx.hash, wei: String(tx.value), via: 'scan' })
+            log('fee', `${short(tx.from)} paid ${formatEther(tx.value)} HYPE in block ${block.number} (${tx.hash.slice(0, 10)}); trading unlocked`)
           }
         }
         scanned = last
-        mkdirSync(STATE_DIR, { recursive: true })
-        writeFileSync(scanFile, JSON.stringify({ block: scanned }))
-        db?.put('fee-scan', { block: scanned })
+        await store.put('fee-scan', { block: scanned })
       }
     } catch (err) {
       log('warn', `fee scan: ${errMsg(err)}`)
@@ -590,13 +579,16 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   // Account box, like Papertrade's portfolio: balances, open PnL at the live mid (before the win haircut), PAPER, and
   // lifetime totals, all from the wallet's account feed.
   // Closes sent from the page, by position id, until the position is gone, the close fails, or 10 minutes pass.
-  const closing = new Map<string, { wallet: Address; intentId: Hex | null; at: number }>()
+  // The claims live in the database (paperwatch.closes), so two tabs or two instances can't both send one.
   const isClosing = (id: string) => {
-    const c = closing.get(id)
-    if (!c) return false
+    const c = store.closes.get(id)
+    if (!c || c.done) return false
     const a = accounts.get(c.wallet)
     const done = Date.now() - c.at > 10 * 60_000 || (c.intentId && a?.failed.has(c.intentId)) || (a?.stream.state && !a.stream.state.positions.has(id))
-    if (done) closing.delete(id)
+    if (done) {
+      c.done = true
+      void store.setClose(id, { done: true }).catch((err) => log('warn', `close #${id}: ${errMsg(err)}`))
+    }
     return !done
   }
 
@@ -685,7 +677,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       }),
     minMarginUsd: Number(trading.minimumTradeSizeRaw) / 1e18,
     minNotionalUsd: Number(trading.minimumOpenNotionalRaw) / 1e18,
-    orders: wallet ? orders.filter((o) => o.wallet === wallet).sort((a, b) => b.createdAt - a.createdAt) : [],
+    orders: wallet ? allOrders().filter((o) => o.wallet === wallet).sort((a, b) => b.createdAt - a.createdAt) : [],
   })
 
   const candles = new CandleStore()
@@ -736,20 +728,18 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         if (!isAddress(body.wallet)) return json(res, 400, { error: 'bad wallet address' })
         const host = (String(req.headers.host ?? 'paperwatch.app').match(/^[\w.:-]+$/) ?? ['paperwatch.app'])[0]
         const message = signInMessage(host, body.wallet, randomBytes(12).toString('hex'), new Date().toISOString())
-        if (signIns.size > 10_000) signIns.clear()
-        signIns.set(body.wallet.toLowerCase(), { message, at: Date.now() })
+        await store.putSignIn(body.wallet, message)
         return json(res, 200, { message })
       }
       if (req.method === 'POST' && url.pathname === '/api/auth/verify') {
         const body = await readBody(req)
         if (!isAddress(body.wallet) || typeof body.signature !== 'string') return json(res, 400, { error: 'bad sign-in' })
-        const pending = signIns.get(body.wallet.toLowerCase())
-        if (!pending || Date.now() - pending.at > SIGN_IN_TTL_MS) return json(res, 400, { error: 'Sign-in expired. Try again.' })
-        const ok = await verifyMessage({ address: body.wallet, message: pending.message, signature: body.signature as Hex }).catch(() => false)
+        // Used up whether or not the signature checks out: each message signs in at most once.
+        const message = await store.takeSignIn(body.wallet, SIGN_IN_TTL_MS)
+        if (!message) return json(res, 400, { error: 'Sign-in expired. Try again.' })
+        const ok = await verifyMessage({ address: body.wallet, message, signature: body.signature as Hex }).catch(() => false)
         if (!ok) return json(res, 401, { error: 'That signature is not from this wallet.' })
-        signIns.delete(body.wallet.toLowerCase())
-        const user = users.getOrCreate(body.wallet)
-        users.save()
+        const user = await store.ensureUser(body.wallet)
         account(user.wallet)
         track('sign_in', user.wallet)
         log('login', short(user.wallet))
@@ -764,7 +754,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         const body = await readBody(req)
         const hash = String(body.hash ?? '')
         if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) return json(res, 400, { error: 'bad transaction hash' })
-        if (usedFeeTxs().has(hash.toLowerCase())) return json(res, 409, { error: 'That payment already unlocked a wallet.' })
+        if (store.isFeeTxUsed(hash)) return json(res, 409, { error: 'That payment already unlocked a wallet.' })
         // One look per call, not a wait: the page asks again every few seconds until the payment confirms.
         const last = feeChecks.get(wallet!) ?? 0
         if (Date.now() - last < FEE_CHECK_MS) return json(res, 429, { error: 'Checking too often; try again in a few seconds.' })
@@ -774,11 +764,11 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         const tx = await client.getTransaction({ hash: hash as Hex })
         const problem = feePaymentProblem(tx, receipt.status, wallet!, FEE_ADDRESS!, FEE_WEI)
         if (problem) return json(res, 400, { error: problem })
-        const user = users.getOrCreate(wallet!)
-        user.fee = { tx: hash.toLowerCase() as Hex, paidAt: Date.now(), wei: String(tx.value) }
-        users.save()
-        track('fee_paid', user.wallet, { tx: hash.toLowerCase(), wei: String(tx.value), via: 'hash' })
-        log('fee', `${short(user.wallet)} paid ${formatEther(tx.value)} HYPE (${hash.slice(0, 10)})`)
+        if (!(await store.setFee(wallet!, { tx: hash.toLowerCase() as Hex, paidAt: Date.now(), wei: String(tx.value) }))) {
+          return json(res, 409, { error: 'That payment already unlocked a wallet.' })
+        }
+        track('fee_paid', wallet!, { tx: hash.toLowerCase(), wei: String(tx.value), via: 'hash' })
+        log('fee', `${short(wallet!)} paid ${formatEther(tx.value)} HYPE (${hash.slice(0, 10)})`)
         return json(res, 200, { paid: true })
       }
       const locked = () => {
@@ -790,15 +780,10 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       // Enable trading: a fresh trading key, approved by the wallet's own signature over Papertrade's RegisterSessionKey.
       if (req.method === 'POST' && url.pathname === '/api/trading/prepare') {
         if (!needWallet() || locked()) return
-        const user = users.getOrCreate(wallet!)
+        const user = await store.ensureUser(wallet!)
         const status = tradingStatus(user)
         if (status.status === 'active' && status.expiry > Date.now() / 1000 + KEY_RENEW_SEC) return json(res, 409, { error: 'Trading is already enabled.' })
         const a = account(user.wallet)
-        const nonces = nonceSource(user)
-        if (!a.noncesChecked) {
-          await nonces.ensureUnused(makeClient(), user.wallet)
-          a.noncesChecked = true
-        }
         const pk = generatePrivateKey()
         const keyAddress = privateKeyToAccount(pk).address
         const input = {
@@ -806,11 +791,10 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           key: keyAddress,
           expiry: BigInt(Math.floor(Date.now() / 1000)) + SESSION_TTL_SEC - 60n,
           feeAddress: zeroAddress, // what the official frontend sends
-          nonce: nonces.take(),
+          nonce: await nextNonce(user.wallet, a),
           deadline: deadlineFromNow(600n),
         }
-        user.pendingKey = { address: keyAddress, sealed: sealKey(pk, keySecret), input: Object.fromEntries(Object.entries(input).map(([k, v]) => [k, String(v)])) }
-        users.save()
+        await store.setPendingKey(user.wallet, { address: keyAddress, sealed: sealKey(pk, keySecret), input: Object.fromEntries(Object.entries(input).map(([k, v]) => [k, String(v)])) })
         return json(res, 200, { typedData: walletTypedData(EXCHANGE_DOMAIN, 'RegisterSessionKey', input), key: keyAddress })
       }
       if (req.method === 'POST' && url.pathname === '/api/trading/register') {
@@ -831,18 +815,16 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
             throw err
           }
         }
-        user.key = { address: pending.address, sealed: pending.sealed, expiry: Number(p.expiry), submittedAt: Date.now(), ...(opts.live ? {} : { registeredAt: Date.now() }) }
-        delete user.pendingKey
-        users.save()
+        const key = { address: pending.address, sealed: pending.sealed, expiry: Number(p.expiry), submittedAt: Date.now(), ...(opts.live ? {} : { registeredAt: Date.now() }) }
+        if (!(await store.activateKey(user.wallet, key))) return json(res, 409, { error: 'Start again: a newer trading key is waiting for approval.' })
         track('trading_enabled', user.wallet, { key: pending.address, dry: !opts.live })
         log('key', `${short(user.wallet)} trading key ${short(pending.address)} ${opts.live ? 'submitted' : 'approved (dry: not sent)'}`)
         if (opts.live) {
           const keyId = pending.address.toLowerCase()
           void account(user.wallet)
             .stream.waitFor((s) => (s.sessionKeys.has(keyId) ? true : undefined), 120_000)
-            .then(() => {
-              if (user.key?.address.toLowerCase() === keyId) user.key.registeredAt = Date.now()
-              users.save()
+            .then(async () => {
+              await store.markKeyRegistered(user.wallet, keyId)
               log('key', `${short(user.wallet)} trading key ${short(keyId)} registered`)
             })
             .catch(() => log('warn', `${short(user.wallet)} trading key ${short(keyId)} not seen on Papertrade within 2 min`))
@@ -855,9 +837,8 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
         const user = users.get(wallet!)
         if (!user?.key) return json(res, 400, { error: 'Trading is not enabled.' })
         const keyAddress = user.key.address
-        delete user.key
-        users.save()
-        for (const o of orders.filter((o) => o.wallet === user.wallet && o.status === 'armed')) settle(o, { status: 'cancelled', note: 'trading turned off' }, 'cancelled (trading off)')
+        await store.clearKey(user.wallet)
+        for (const o of allOrders().filter((o) => o.wallet === user.wallet && o.status === 'armed')) await settle(o, ['armed'], { status: 'cancelled', note: 'trading turned off' }, 'cancelled (trading off)')
         track('trading_disabled', user.wallet, { key: keyAddress })
         log('key', `${short(user.wallet)} turned trading off (key ${short(keyAddress)})`)
         return json(res, 200, { tx: { to: CONTRACTS.sessionKeyManager, data: encodeFunctionData({ abi: REVOKE_ABI, functionName: 'revokeSessionKey', args: [keyAddress] }) } })
@@ -866,17 +847,16 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       if (req.method === 'POST' && url.pathname === '/api/orders') {
         if (!needWallet() || locked()) return
         if (tradingStatus(users.get(wallet!)).status !== 'active') return json(res, 400, { error: 'Enable trading first.' })
-        if (orders.filter((o) => o.wallet === wallet && o.status === 'armed').length >= MAX_ARMED_PER_WALLET) {
+        if (allOrders().filter((o) => o.wallet === wallet && o.status === 'armed').length >= MAX_ARMED_PER_WALLET) {
           return json(res, 400, { error: `You can have up to ${MAX_ARMED_PER_WALLET} open limit intents.` })
         }
         const input = (await readBody(req)) as OrderInput
         const inst = instOf(String(input.symbol ?? ''))
         const mid = inst && midPx(inst)
         if (inst && !mid) return json(res, 400, { error: 'no live price yet; try again in a few seconds' })
-        const o = newOrder(input, inst, mid?.px ?? 0, Date.now(), wallet!, Number(trading.minimumOpenNotionalRaw) / 1e18)
-        if (typeof o === 'string') return json(res, 400, { error: o })
-        orders.push(o)
-        persist()
+        const placed = newOrder(input, inst, mid?.px ?? 0, Date.now(), wallet!, Number(trading.minimumOpenNotionalRaw) / 1e18)
+        if (typeof placed === 'string') return json(res, 400, { error: placed })
+        const o = await store.addOrder(placed)
         track('order_placed', o.wallet, { id: o.id, symbol: o.symbol, side: o.isLong ? 'long' : 'short', kind: o.kind ?? 'limit', leverage: o.leverage, triggerPx: o.triggerPx, marginPct: o.marginPct, fixedMarginUsd: o.fixedMarginUsd })
         log('place', `${describe(o)}, expires ${new Date(o.expiresAt).toISOString()}, deadline ${o.deadlineSec}s (mid ${mid!.px})`)
         return json(res, 200, o)
@@ -895,26 +875,29 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           log('close', `${short(wallet!)} #${id}: dry run, nothing sent`)
           return json(res, 200, { dry: true })
         }
-        const nonces = nonceSource(user)
-        if (!a.noncesChecked) {
-          await nonces.ensureUnused(client, wallet!)
-          a.noncesChecked = true
+        if (!(await store.claimClose(id, wallet!))) return json(res, 409, { error: 'A close for this position is already on its way.' })
+        let signed: Awaited<ReturnType<typeof signIntent>>
+        try {
+          signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'Close', {
+            user: wallet!,
+            positionIds: [BigInt(id)],
+            nonce: await nextNonce(wallet!, a),
+            deadline: deadlineFromNow(INTENT_TTL_SEC),
+          })
+          await store.setClose(id, { intentId: signed.intentId })
+        } catch (err) {
+          await store.setClose(id, { done: true }).catch(() => {}) // nothing sent: free the claim
+          throw err
         }
-        const signed = await signIntent(privateKeyToAccount(openKey(user.key.sealed, keySecret)), EXCHANGE_DOMAIN, 'Close', {
-          user: wallet!,
-          positionIds: [BigInt(id)],
-          nonce: nonces.take(),
-          deadline: deadlineFromNow(INTENT_TTL_SEC),
-        })
-        if (!(await dbReady())) return json(res, 503, { error: 'Saving is behind right now; try the close again in a few seconds.' })
         try {
           await submitIntent('closePositions', signed.signed, signed.intentId)
         } catch (err) {
+          // A refusal sent nothing, so the claim is freed; anything else might have reached the relayer and keeps it.
+          if (err instanceof RelayerError) await store.setClose(id, { done: true }).catch(() => {})
           if (err instanceof RelayerError && err.reason === 'noOpenPositions') return json(res, 409, { error: 'A close for this position is already pending on Papertrade.' })
           if (err instanceof RelayerError) return json(res, 400, { error: `Papertrade refused the close (${err.code}${err.reason ? `/${err.reason}` : ''}).` })
           throw err
         }
-        closing.set(id, { wallet: wallet!, intentId: signed.intentId, at: Date.now() })
         track('position_close', wallet!, { positionId: id, intentId: signed.intentId })
         log('close', `${short(wallet!)} #${id} sent ${signed.intentId.slice(0, 10)}`)
         return json(res, 200, { intentId: signed.intentId })
@@ -923,10 +906,11 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       const cancel = url.pathname.match(/^\/api\/orders\/([\w-]+)\/cancel$/)
       if (req.method === 'POST' && cancel) {
         if (!needWallet()) return
-        const o = orders.find((x) => x.id === cancel[1] && x.wallet === wallet)
+        const o = allOrders().find((x) => x.id === cancel[1] && x.wallet === wallet)
         if (!o) return json(res, 404, { error: 'no such order' })
-        if (o.status !== 'armed') return json(res, 409, { error: `order is ${o.status}; only armed orders can be cancelled` })
-        settle(o, { status: 'cancelled', note: 'cancelled' }, 'cancelled')
+        if (o.status !== 'armed' || !(await settle(o, ['armed'], { status: 'cancelled', note: 'cancelled' }, 'cancelled'))) {
+          return json(res, 409, { error: `order is ${o.status}; only armed orders can be cancelled` })
+        }
         return json(res, 200, o)
       }
       return json(res, 404, { error: 'not found' })
@@ -934,15 +918,15 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       return json(res, 400, { error: errMsg(err) })
     }
   }).listen(PORT, HOST, () => {
-    const armed = orders.filter((o) => o.status === 'armed').length
+    const armed = allOrders().filter((o) => o.status === 'armed').length
     const fee = FEE_ADDRESS ? `unlock ${formatEther(FEE_WEI)} HYPE to ${short(FEE_ADDRESS)} (${FEE_EXEMPT.size} exempt)` : 'no unlock fee'
-    log('start', `${mode.toUpperCase()} limit intents on ${HOST}:${PORT}; ${users.all().length} account(s), ${armed} armed order(s); ${fee}; hold while ${MAX_QUEUED}+ intents queued. Opens only, never closes.`)
+    log('start', `${mode.toUpperCase()} limit intents on ${HOST}:${PORT}; ${store.users.size} account(s), ${armed} armed order(s); ${fee}; hold while ${MAX_QUEUED}+ intents queued. Opens only, never closes.`)
   })
 
   await new Promise<void>((resolve) => {
     process.once('SIGINT', resolve)
     process.once('SIGTERM', resolve)
   })
-  persist()
+  await store.flushEvents()
   for (const a of accounts.values()) a.stream.stop()
 }

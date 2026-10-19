@@ -61,7 +61,7 @@ export function saveState(mode: StateName, state: BotState): void {
   writeAtomic(statePath(mode), JSON.stringify(state, replacer, 2))
 }
 
-const NONCE_ABI = [
+export const NONCE_ABI = [
   {
     type: 'function',
     name: 'isNonceUsed',

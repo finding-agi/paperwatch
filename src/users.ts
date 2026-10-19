@@ -1,10 +1,5 @@
 import { createCipheriv, createDecipheriv, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
 import type { Address, Hex } from 'viem'
-import { STATE_DIR } from './config.ts'
-import type { Db } from './db.ts'
-import { randomNonceStart } from './state.ts'
 
 // Accounts for the public Limit Intents page. Each visitor signs in with their own wallet (a signed message, no gas),
 // then approves a Papertrade trading key (session key) for it. The server holds that key, encrypted at rest, so it
@@ -80,48 +75,4 @@ export function signInMessage(host: string, wallet: Address, nonce: string, issu
     `Nonce: ${nonce}`,
     `Issued At: ${issuedAt}`,
   ].join('\n')
-}
-
-export class UserStore {
-  #users: Record<string, UserRecord>
-  readonly #file = join(STATE_DIR, 'users.json')
-  readonly #db: Db | null
-
-  constructor(db: Db | null = null, users?: Record<string, UserRecord>) {
-    this.#db = db
-    this.#users = users ?? (existsSync(this.#file) ? JSON.parse(readFileSync(this.#file, 'utf8')) : {})
-  }
-
-  /** With a database, load from it; the first time (an empty table), copy in users.json. */
-  static async open(db: Db | null): Promise<UserStore> {
-    if (!db) return new UserStore()
-    const rows = await db.load<UserRecord>('users')
-    if (rows.size) return new UserStore(db, Object.fromEntries(rows))
-    const store = new UserStore(db)
-    if (store.all().length) store.save()
-    return store
-  }
-
-  get(wallet: string): UserRecord | undefined {
-    return this.#users[wallet.toLowerCase()]
-  }
-
-  getOrCreate(wallet: Address): UserRecord {
-    const id = wallet.toLowerCase()
-    this.#users[id] ??= { wallet: id as Address, createdAt: Date.now(), nextNonce: String(randomNonceStart()) }
-    return this.#users[id]
-  }
-
-  all(): UserRecord[] {
-    return Object.values(this.#users)
-  }
-
-  /** Write users.json (kept as a fallback copy) and mirror changed users to the database. */
-  save(): void {
-    mkdirSync(STATE_DIR, { recursive: true })
-    const tmp = `${this.#file}.tmp`
-    writeFileSync(tmp, JSON.stringify(this.#users, null, 2), { mode: 0o600 })
-    renameSync(tmp, this.#file)
-    this.#db?.sync('users', Object.entries(this.#users))
-  }
 }
