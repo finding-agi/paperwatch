@@ -106,9 +106,9 @@ alter table ${S}.events enable row level security;
 const KEEP_DONE = 50 // finished orders kept per wallet
 const REFRESH_OVERLAP_MS = 5000 // re-read rows changed this long before the last look, for writes still committing
 const CLOSE_STALE_MS = 10 * 60_000 // a close claim this old no longer blocks another close
-// Connections per process. Supabase's free session pooler takes ~15 clients in all: 2 web replicas + the worker
-// (its pool plus the lock's own connection) stay near 10.
-const POOL_MAX = Number(process.env.PT_DB_POOL_MAX ?? 3)
+// Connections per process, through Supabase's transaction pooler (DATABASE_URL on port 6543), which shares a small
+// server pool among many clients. The worker's lock uses one session connection (DATABASE_SESSION_URL, port 5432).
+const POOL_MAX = Number(process.env.PT_DB_POOL_MAX ?? 10)
 // Advisory lock id: only the process holding it sends orders and closes. Per schema, so a load test's worker in the
 // same database never takes production's lock (production keeps 7277001).
 const WORKER_LOCK = S === 'paperwatch' ? 7_277_001 : 7_277_001 + 1 + [...S].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1_000_000, 0)

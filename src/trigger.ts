@@ -375,10 +375,12 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   // The wallet's next intent nonce from the database counter. The first one this process uses for a wallet is checked
   // on-chain too (a counter restored from an old copy); a used one jumps to a fresh random range.
   const noncesChecked = new Set<string>()
-  const nextNonce = async (wallet: Address) => {
+  // `onChain: false` skips the check (registration: a new wallet's counter starts at a random 72-bit number, and checking
+  // each sign-up through the public RPC got rate-limited in the load test).
+  const nextNonce = async (wallet: Address, onChain = true) => {
     for (let i = 0; i < 64; i++) {
       const n = await store.takeNonce(wallet)
-      if (noncesChecked.has(wallet.toLowerCase())) return n
+      if (!onChain || noncesChecked.has(wallet.toLowerCase())) return n
       const used = await client.readContract({ address: CONTRACTS.sessionKeyManager, abi: NONCE_ABI, functionName: 'isNonceUsed', args: [wallet, n] })
       if (!used) {
         noncesChecked.add(wallet.toLowerCase())
@@ -979,7 +981,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           key: keyAddress,
           expiry: BigInt(Math.floor(Date.now() / 1000)) + SESSION_TTL_SEC - 60n,
           feeAddress: zeroAddress, // what the official frontend sends
-          nonce: await nextNonce(user.wallet),
+          nonce: await nextNonce(user.wallet, false),
           deadline: deadlineFromNow(600n),
         }
         await store.setPendingKey(user.wallet, { address: keyAddress, sealed: keys.seal(pk), input: Object.fromEntries(Object.entries(input).map(([k, v]) => [k, String(v)])) })
