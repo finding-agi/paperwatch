@@ -42,6 +42,8 @@ const PRICE_STALE_MS = 10_000
 const TRADING_POLL_MS = 5000
 const TRADING_STALE_MS = 30_000
 const CHECK_MS = 1000
+// Opens sent per check pass (one pass a second), at most one per wallet so two orders can't spend the same margin.
+const SENDS_PER_PASS = Number(process.env.PT_SENDS_PER_SECOND ?? 50)
 const MAX_ATTEMPTS = 3 // sends per order; a relayer rejection or an expired intent re-arms it until then
 const AUTH_TTL_MS = 7 * 86_400_000 // sign-in cookie lifetime
 const SIGN_IN_TTL_MS = 5 * 60_000 // a sign-in message must be signed within this
@@ -475,7 +477,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
     else await settle(o, ['sent'], { status: 'unconfirmed', note: 'no fill seen; it may still land, check Papertrade' }, 'no fill or failure seen')
   }
 
-  // One check a second: expire old orders, fire at most one triggered order per pass.
+  // One check a second: expire old orders, then send up to SENDS_PER_PASS triggered orders, one per wallet.
   let busy = false
   const firing = new Set<string>() // orders this process is sending, so the next pass doesn't try to claim them again
   const check = async () => {
@@ -485,7 +487,10 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
       for (const o of allOrders()) {
         if (o.status === 'armed' && Date.now() > o.expiresAt) await settle(o, ['armed'], { status: 'expired', note: 'expired before triggering' }, 'expired')
       }
+      const sentTo = new Set<string>()
       for (const o of allOrders().filter((o) => o.status === 'armed' && !firing.has(o.id))) {
+        if (sentTo.size >= SENDS_PER_PASS) break
+        if (sentTo.has(o.wallet) || [...firing].some((id) => store.orders.get(id)?.wallet === o.wallet)) continue
         const inst = instOf(o.symbol)
         const mid = inst && midPx(inst)
         if (!inst || !mid) {
@@ -509,10 +514,10 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
           continue
         }
         firing.add(o.id)
+        sentTo.add(o.wallet)
         void fire(o, inst, mid)
           .catch((err) => log('warn', `${describe(o)}: ${errMsg(err)}`))
           .finally(() => firing.delete(o.id))
-        break
       }
     } finally {
       busy = false
