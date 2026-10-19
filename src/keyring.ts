@@ -7,13 +7,44 @@ import { openKey, sealKey } from './users.ts'
 // Sealed format: v2.<kid>.<ephemeral X25519 public key>.<iv>.<tag>.<ciphertext> (base64 parts). The kid names the key
 // pair, so a rotation can add a new pair while the old one still opens what it sealed, and rewrap moves rows across.
 // The first format (salt.iv.tag.data, AES with a key derived from PT_KEY_SECRET) still opens while that secret is set.
+// In production the worker's private keys arrive encrypted by AWS KMS (PT_KEY_PRIVATE_KMS = kid:ciphertext, comma-
+// separated) and are decrypted once at startup, with an AWS login that can only decrypt, only with this context.
 
 const INFO = Buffer.from('paperwatch trading key v2')
+export const KMS_CONTEXT = (kid: string) => ({ app: 'paperwatch', purpose: 'trading-key-seal', kid })
+const KMS_REGION = (env: NodeJS.ProcessEnv) => env.AWS_REGION || env.AWS_DEFAULT_REGION || 'us-west-2'
+
+/** KMS calls, swappable in tests. */
+export type Kms = {
+  decrypt(ciphertext: Buffer, context: Record<string, string>): Promise<Buffer>
+  encrypt(keyId: string, plaintext: Buffer, context: Record<string, string>): Promise<Buffer>
+}
+export async function awsKms(env = process.env): Promise<Kms> {
+  const { KMSClient, DecryptCommand, EncryptCommand } = await import('@aws-sdk/client-kms')
+  const client = new KMSClient({ region: KMS_REGION(env) })
+  return {
+    async decrypt(CiphertextBlob, EncryptionContext) {
+      const out = await client.send(new DecryptCommand({ CiphertextBlob, EncryptionContext }))
+      return Buffer.from(out.Plaintext!)
+    },
+    async encrypt(KeyId, Plaintext, EncryptionContext) {
+      const out = await client.send(new EncryptCommand({ KeyId, Plaintext, EncryptionContext }))
+      return Buffer.from(out.CiphertextBlob!)
+    },
+  }
+}
 const b64 = (b: Buffer) => b.toString('base64')
 const raw = (k: KeyObject) => k.export({ format: 'der', type: 'spki' }) as Buffer
 
 /** Short id of a public key: the first 8 hex of the SHA-256 of its DER. */
 export const keyId = (publicKey: KeyObject) => createHash('sha256').update(raw(publicKey)).digest('hex').slice(0, 8)
+
+/** A fresh pair whose private half is encrypted by KMS at once: kid:ciphertext, the form PT_KEY_PRIVATE_KMS takes. */
+export async function newKmsKeyPair(kms: Kms, kmsKeyId: string): Promise<{ kid: string; publicKey: string; privateKms: string }> {
+  const { kid, publicKey, privateKey } = newKeyPair()
+  const blob = await kms.encrypt(kmsKeyId, Buffer.from(privateKey), KMS_CONTEXT(kid))
+  return { kid, publicKey, privateKms: `${kid}:${blob.toString('base64')}` }
+}
 
 /** A fresh key pair, as the base64 DER strings PT_KEY_PUBLIC and PT_KEY_PRIVATE take. */
 export function newKeyPair(): { kid: string; publicKey: string; privateKey: string } {
@@ -46,6 +77,27 @@ export class Keyring {
       privateKeys: (env.PT_KEY_PRIVATE ?? '').split(',').map((k) => k.trim()).filter(Boolean),
       legacySecret: env.PT_KEY_SECRET || localSecret,
     })
+  }
+
+  /**
+   * Like fromEnv, plus the KMS-encrypted private keys in PT_KEY_PRIVATE_KMS, decrypted now. Each must decrypt under
+   * its own kid and turn out to be that kid's key, or this throws (the worker then doesn't start).
+   */
+  static async load(env = process.env, localSecret?: string, kms?: Kms): Promise<Keyring> {
+    const entries = (env.PT_KEY_PRIVATE_KMS ?? '').split(',').map((e) => e.trim()).filter(Boolean)
+    const privateKeys = (env.PT_KEY_PRIVATE ?? '').split(',').map((k) => k.trim()).filter(Boolean)
+    if (entries.length) {
+      const client = kms ?? (await awsKms(env))
+      for (const entry of entries) {
+        const [kid, blob] = entry.split(':')
+        if (!kid || !blob) throw new Error('PT_KEY_PRIVATE_KMS entries are kid:ciphertext')
+        const key = (await client.decrypt(Buffer.from(blob, 'base64'), KMS_CONTEXT(kid))).toString()
+        const got = keyId(createPublicKey(createPrivateKey({ key: Buffer.from(key, 'base64'), format: 'der', type: 'pkcs8' })))
+        if (got !== kid) throw new Error(`PT_KEY_PRIVATE_KMS: the key labelled ${kid} is ${got}`)
+        privateKeys.push(key)
+      }
+    }
+    return new Keyring({ publicKey: env.PT_KEY_PUBLIC?.trim() || undefined, privateKeys, legacySecret: env.PT_KEY_SECRET || localSecret })
   }
 
   get kid(): string | null {

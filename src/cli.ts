@@ -18,7 +18,7 @@ import { runIntakeMonitor } from './intake.ts'
 import { runQueueView } from './queue-viz.ts'
 import { runOpener } from './opener.ts'
 import { runTrigger } from './trigger.ts'
-import { newKeyPair } from './keyring.ts'
+import { awsKms, newKeyPair, newKmsKeyPair } from './keyring.ts'
 import { NonceSource, createSessionKey, loadSessionKey, loadState, saveState } from './state.ts'
 
 const M = (x: number) => `${usd(x / 1e6, 2)}M`
@@ -185,21 +185,35 @@ const HELP = `usage: npm run <command>
   opener      open ONE long + short pair now (--live to send), then do nothing: never closes or resets
   trigger     page at http://localhost:8788 for opens that fire when Hyperliquid's mid crosses your price (--live to send)
   close-all   close EVERY open position on the account, including ones the bot didn't open
-  keys <dir>  new trading-key seal pair: prints PT_KEY_PUBLIC, writes PT_KEY_PRIVATE to <dir>/trading-key-<kid>.private
+  keys <dir>  new trading-key seal pair: prints PT_KEY_PUBLIC, writes the private half to <dir> (--kms alias/x: KMS-encrypted)
 
 Config lives in .env (see .env.example).`
 
 const [cmd, ...args] = process.argv.slice(2)
 
-/** A seal key pair for trading keys. The private half goes to a file (owner-only), never to the terminal. */
-async function newTradingKeyPair(dir: string | undefined): Promise<void> {
-  if (!dir) throw new Error('usage: npm run keys -- <dir>')
-  const { kid, publicKey, privateKey } = newKeyPair()
+/**
+ * A seal key pair for trading keys. The private half goes to a file (owner-only), never to the terminal; with
+ * --kms <key id or alias> it is encrypted by AWS KMS first (your local AWS login), so it never touches disk in the clear.
+ */
+async function newTradingKeyPair(argv: string[]): Promise<void> {
+  const kmsAt = argv.indexOf('--kms')
+  const kmsKey = kmsAt >= 0 ? argv[kmsAt + 1] : undefined
+  const dir = argv.filter((_, i) => i !== kmsAt && i !== kmsAt + 1)[0]
+  if (!dir || (kmsAt >= 0 && !kmsKey)) throw new Error('usage: npm run keys -- [--kms alias/<name>] <dir>')
   mkdirSync(dir, { recursive: true })
+  if (kmsKey) {
+    const { kid, publicKey, privateKms } = await newKmsKeyPair(await awsKms(), kmsKey)
+    const file = join(dir, `trading-key-${kid}.kms`)
+    writeFileSync(file, privateKms, { mode: 0o600, flag: 'wx' })
+    console.log(`kid ${kid}\nPT_KEY_PUBLIC=${publicKey}\nPT_KEY_PRIVATE_KMS (KMS-encrypted) is in ${file}: set it on the worker only`)
+    return
+  }
+  const { kid, publicKey, privateKey } = newKeyPair()
   const file = join(dir, `trading-key-${kid}.private`)
   writeFileSync(file, privateKey, { mode: 0o600, flag: 'wx' })
   console.log(`kid ${kid}\nPT_KEY_PUBLIC=${publicKey}\nPT_KEY_PRIVATE is in ${file} (set it on the worker only, then delete the file)`)
 }
+
 const commands: Record<string, () => Promise<void>> = {
   status,
   session,
@@ -213,7 +227,7 @@ const commands: Record<string, () => Promise<void>> = {
   backtest: () => runBacktest(args),
   restrike: () => runRestrikeBacktest(args),
   vol: () => runVol(args),
-  keys: () => newTradingKeyPair(args[0]),
+  keys: () => newTradingKeyPair(args),
 }
 
 const fn = cmd ? commands[cmd] : undefined

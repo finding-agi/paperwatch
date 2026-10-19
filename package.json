@@ -25,6 +25,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-kms": "3.1146.0",
     "@fontsource-variable/manrope": "5.2.8",
     "lightweight-charts": "4.2.0",
     "pg": "8.23.1",

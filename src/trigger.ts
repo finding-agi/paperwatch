@@ -241,7 +241,7 @@ export async function runTrigger(opts: { live: boolean }): Promise<void> {
   // Trading keys at rest (src/keyring.ts): web seals with PT_KEY_PUBLIC, the worker opens with PT_KEY_PRIVATE. The old
   // PT_KEY_SECRET still works for both until it is removed; locally a fixed dry-run secret stands in.
   if (process.env.PT_KEY_SECRET && process.env.PT_KEY_SECRET.length < 32) throw new Error('PT_KEY_SECRET must be 32+ characters')
-  const keys = Keyring.fromEnv(process.env, PUBLIC || opts.live ? undefined : 'local-dry-run-only-not-a-real-secret')
+  const keys = await Keyring.load(process.env, PUBLIC || opts.live ? undefined : 'local-dry-run-only-not-a-real-secret')
   if (ROLE !== 'worker' && !keys.canSeal) throw new Error('set PT_KEY_PUBLIC (seals new trading keys)')
   if (ROLE !== 'web' && !keys.canOpen) throw new Error('set PT_KEY_PRIVATE (opens trading keys to send orders)')
   log('keys', `seals with ${keys.kid ?? (keys.canSeal ? 'PT_KEY_SECRET' : 'nothing')}; opens ${ROLE === 'web' && keys.opens.length ? `${keys.opens.join(', ')} (a web instance needs none)` : keys.opens.join(', ') || 'nothing'}`)

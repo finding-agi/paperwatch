@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
 import type { Address, Hex } from 'viem'
 import { Store, liteQuery } from '../src/db.ts'
-import { Keyring, newKeyPair } from '../src/keyring.ts'
+import { Keyring, newKeyPair, newKmsKeyPair } from '../src/keyring.ts'
 import { sealKey } from '../src/users.ts'
 
 const PK = ('0x' + 'ab'.repeat(32)) as Hex
@@ -67,4 +67,43 @@ test('reseal swaps a sealed key only if it is unchanged', async () => {
   await store.setPendingKey(A, { address: '0xNext' as Address, sealed: 'p1', input: { a: '1' } })
   assert.equal(await store.reseal(A, 'pending', 'p1', 'v2.k.p1'), true)
   assert.deepEqual(store.users.get(A)!.pendingKey, { address: '0xNext', sealed: 'v2.k.p1', input: { a: '1' } })
+})
+
+/** A stand-in for KMS: "encrypts" by tagging the bytes with the context, and refuses any other context on decrypt. */
+const fakeKms = () => {
+  const calls: Record<string, string>[] = []
+  return {
+    calls,
+    kms: {
+      async encrypt(_key: string, plaintext: Buffer, context: Record<string, string>) {
+        return Buffer.from(JSON.stringify({ context, data: plaintext.toString('base64') }))
+      },
+      async decrypt(blob: Buffer, context: Record<string, string>) {
+        calls.push(context)
+        const { context: sealed, data } = JSON.parse(blob.toString())
+        if (JSON.stringify(sealed) !== JSON.stringify(context)) throw new Error('InvalidCiphertextException')
+        return Buffer.from(data, 'base64')
+      },
+    },
+  }
+}
+
+test('KMS-wrapped private keys open seals; the context names the app, purpose and kid', async () => {
+  const { kms, calls } = fakeKms()
+  const { kid, publicKey, privateKms } = await newKmsKeyPair(kms, 'alias/paperwatch-trading-seal')
+  assert.match(privateKms, new RegExp(`^${kid}:`))
+  const old = newKeyPair()
+  const ring = await Keyring.load({ PT_KEY_PUBLIC: publicKey, PT_KEY_PRIVATE_KMS: privateKms, PT_KEY_PRIVATE: old.privateKey }, undefined, kms)
+  assert.deepEqual(calls, [{ app: 'paperwatch', purpose: 'trading-key-seal', kid }])
+  assert.deepEqual(ring.opens.sort(), [kid, old.kid].sort())
+  assert.equal(ring.open(new Keyring({ publicKey }).seal(PK)), PK)
+  assert.equal(ring.open(new Keyring({ publicKey: old.publicKey }).seal(PK)), PK)
+})
+
+test('a KMS entry relabelled with another kid does not load', async () => {
+  const { kms } = fakeKms()
+  const { kid, privateKms } = await newKmsKeyPair(kms, 'k')
+  const other = newKeyPair().kid
+  await assert.rejects(Keyring.load({ PT_KEY_PRIVATE_KMS: privateKms.replace(kid, other) }, undefined, kms), /InvalidCiphertext/)
+  await assert.rejects(Keyring.load({ PT_KEY_PRIVATE_KMS: 'no-colon' }, undefined, kms), /kid:ciphertext/)
 })
