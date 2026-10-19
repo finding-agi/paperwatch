@@ -179,8 +179,12 @@ export class Store {
       const ca = process.env.PT_DATABASE_CA
       const pool = new pg.Pool({ connectionString: url.replace(/[?&]sslmode=[^&]*/, ''), ssl: ca ? { ca } : { rejectUnauthorized: false }, max: POOL_MAX })
       pool.on('error', (err) => log('warn', `database: ${err.message}`))
+      // The worker's lock needs a real session. With DATABASE_URL on Supabase's transaction pooler (port 6543, many
+      // clients), DATABASE_SESSION_URL (the session pooler, port 5432, ~15 clients for the whole project) carries it.
+      const sessionUrl = process.env.DATABASE_SESSION_URL
+      const sessionPool = sessionUrl ? new pg.Pool({ connectionString: sessionUrl.replace(/[?&]sslmode=[^&]*/, ''), ssl: ca ? { ca } : { rejectUnauthorized: false }, max: 1 }) : pool
       const session = async (): Promise<Query> => {
-        const client = await pool.connect() // never released: a session-level lock lives as long as this connection
+        const client = await sessionPool.connect() // never released: a session-level lock lives as long as this connection
         client.on('error', (err) => log('warn', `database session: ${err.message}`))
         return (sql, params) => client.query(sql, params)
       }

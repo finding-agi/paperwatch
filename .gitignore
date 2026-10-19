@@ -7,3 +7,4 @@ node_modules/
 HANDOFF.md
 RESEARCH.md
 .deploy-site/
+.deploy-loadgen/

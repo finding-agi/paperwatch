@@ -14,10 +14,10 @@ trap 'rm -rf "$stage"' EXIT
 cp -R Dockerfile package.json package-lock.json src "$stage/"
 cp railway.web.json "$stage/railway.json"
 project="aa5097cb-ba1e-49bc-ab91-55b39ce7b91d"
-deploy() { (cd "$stage" && railway up --no-gitignore --project "$project" --environment production --service "$1" --ci | tail -1); }
+deploy() { (cd "$stage" && railway up --no-gitignore --project "$project" --environment "${RAILWAY_ENV:-production}" --service "$1" --ci | tail -1); }
 case "$which" in
-  worker) deploy paperwatch-worker ;;
-  web) deploy queue-view ;;
-  both) deploy paperwatch-worker && deploy queue-view ;;
+  worker) deploy "${WORKER_SERVICE:-paperwatch-worker}" ;;
+  web) deploy "${WEB_SERVICE:-queue-view}" ;;
+  both) deploy "${WORKER_SERVICE:-paperwatch-worker}" && deploy "${WEB_SERVICE:-queue-view}" ;;
   *) echo "usage: npm run deploy:site -- worker | web | both" >&2; exit 1 ;;
 esac

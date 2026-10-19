@@ -198,7 +198,7 @@ const [cmd, ...args] = process.argv.slice(2)
 async function newTradingKeyPair(argv: string[]): Promise<void> {
   const kmsAt = argv.indexOf('--kms')
   const kmsKey = kmsAt >= 0 ? argv[kmsAt + 1] : undefined
-  const dir = argv.filter((_, i) => i !== kmsAt && i !== kmsAt + 1)[0]
+  const dir = kmsAt >= 0 ? argv.filter((_, i) => i !== kmsAt && i !== kmsAt + 1)[0] : argv[0]
   if (!dir || (kmsAt >= 0 && !kmsKey)) throw new Error('usage: npm run keys -- [--kms alias/<name>] <dir>')
   mkdirSync(dir, { recursive: true })
   if (kmsKey) {
