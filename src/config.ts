@@ -3,7 +3,7 @@ import type { Address } from 'viem'
 export const CHAIN_ID = 999
 export const RPC_URL = process.env.PT_RPC_URL || 'https://rpc.hyperliquid.xyz/evm'
 export const API_URL = process.env.PT_API_URL || 'https://exchange.papertrade.xyz'
-export const USER_AGENT = 'papertrade-bot/0.1'
+export const USER_AGENT = 'paperwatch/1.0 (+https://paperwatch.app)'
 // On Railway these point at a mounted volume so state survives restarts and redeploys.
 export const STATE_DIR = process.env.PT_STATE_DIR || '.state'
 export const SECRETS_DIR = process.env.PT_SECRETS_DIR || '.secrets'
